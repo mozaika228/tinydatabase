@@ -1,0 +1,558 @@
+use crate::error::{Error, Result};
+use crate::format::Record;
+use crate::sstable::{read_manifest, read_table, write_manifest, write_table, Manifest};
+use crate::wal::Wal;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+#[derive(Clone)]
+struct VersionedValue {
+    commit_ts: u64,
+    value: Option<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct DbState {
+    data: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
+    next_tx_id: u64,
+    last_commit_ts: u64,
+}
+
+struct DbInner {
+    dir: PathBuf,
+    manifest_path: PathBuf,
+    state: Mutex<DbState>,
+    wal: Mutex<Wal>,
+    commit_lock: Mutex<()>,
+}
+
+#[derive(Clone)]
+pub struct Database {
+    inner: Arc<DbInner>,
+}
+
+pub struct Transaction {
+    db: Database,
+    tx_id: u64,
+    snapshot_ts: u64,
+    writes: HashMap<Vec<u8>, Option<Vec<u8>>>,
+    closed: bool,
+}
+
+impl Database {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let dir = path.as_ref().to_path_buf();
+        fs::create_dir_all(&dir)?;
+        let wal_path = dir.join("db.wal");
+        let manifest_path = dir.join("MANIFEST");
+        let snapshot_path = dir.join("db.snapshot");
+
+        if !wal_path.exists() {
+            File::create(&wal_path)?;
+        }
+
+        let mut state = if manifest_path.exists() {
+            load_state_from_manifest(&dir, &manifest_path)?
+        } else if snapshot_path.exists() {
+            read_legacy_snapshot(&snapshot_path)?
+        } else {
+            DbState::default()
+        };
+
+        let mut pending: HashMap<u64, Vec<Record>> = HashMap::new();
+        let mut max_tx_id = state.next_tx_id;
+        for record in Wal::read_all(&wal_path)? {
+            max_tx_id = max_tx_id.max(record_tx_id(&record));
+            apply_record_for_recovery(&mut state, &mut pending, record)?;
+        }
+        state.next_tx_id = max_tx_id;
+
+        let wal = Wal::open(&wal_path)?;
+        let inner = Arc::new(DbInner {
+            dir,
+            manifest_path,
+            state: Mutex::new(state),
+            wal: Mutex::new(wal),
+            commit_lock: Mutex::new(()),
+        });
+        Ok(Self { inner })
+    }
+
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| Error::Corruption("state lock poisoned"))?;
+        let snapshot_ts = state.last_commit_ts;
+        Ok(read_visible(&state, key, snapshot_ts))
+    }
+
+    pub fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let mut tx = self.begin_tx()?;
+        tx.set(key, value);
+        tx.commit()
+    }
+
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        let mut tx = self.begin_tx()?;
+        tx.delete(key);
+        tx.commit()
+    }
+
+    pub fn begin_tx(&self) -> Result<Transaction> {
+        let (tx_id, snapshot_ts) = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| Error::Corruption("state lock poisoned"))?;
+            state.next_tx_id += 1;
+            (state.next_tx_id, state.last_commit_ts)
+        };
+
+        let mut wal = self
+            .inner
+            .wal
+            .lock()
+            .map_err(|_| Error::Corruption("wal lock poisoned"))?;
+        wal.append(&Record::Begin { tx_id })?;
+
+        Ok(Transaction {
+            db: self.clone(),
+            tx_id,
+            snapshot_ts,
+            writes: HashMap::new(),
+            closed: false,
+        })
+    }
+
+    pub fn checkpoint(&self) -> Result<()> {
+        let _commit_guard = self
+            .inner
+            .commit_lock
+            .lock()
+            .map_err(|_| Error::Corruption("commit lock poisoned"))?;
+
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| Error::Corruption("state lock poisoned"))?;
+
+        let materialized = materialize_latest(&state.data);
+        let segment_name = format!("segment-{:020}.sst", state.last_commit_ts);
+        let segment_tmp_name = format!("{segment_name}.tmp");
+        let segment_tmp_path = self.inner.dir.join(&segment_tmp_name);
+        let segment_path = self.inner.dir.join(&segment_name);
+        write_table(&segment_tmp_path, &materialized)?;
+        if segment_path.exists() {
+            fs::remove_file(&segment_path)?;
+        }
+        fs::rename(&segment_tmp_path, &segment_path)?;
+
+        let previous_segment = if self.inner.manifest_path.exists() {
+            read_manifest(&self.inner.manifest_path)?.current_segment
+        } else {
+            None
+        };
+
+        let manifest_tmp = self.inner.dir.join("MANIFEST.tmp");
+        let manifest = Manifest {
+            last_commit_ts: state.last_commit_ts,
+            next_tx_id: state.next_tx_id,
+            current_segment: Some(segment_name.clone()),
+        };
+        write_manifest(&manifest_tmp, &manifest)?;
+        fs::rename(&manifest_tmp, &self.inner.manifest_path)?;
+        drop(state);
+
+        if let Some(old) = previous_segment {
+            if old != segment_name {
+                let old_path = self.inner.dir.join(old);
+                if old_path.exists() {
+                    let _ = fs::remove_file(old_path);
+                }
+            }
+        }
+
+        let mut wal = self
+            .inner
+            .wal
+            .lock()
+            .map_err(|_| Error::Corruption("wal lock poisoned"))?;
+        wal.sync()?;
+        wal.reset()?;
+        Ok(())
+    }
+}
+
+impl Transaction {
+    pub fn set(&mut self, key: &[u8], value: &[u8]) {
+        self.writes.insert(key.to_vec(), Some(value.to_vec()));
+    }
+
+    pub fn delete(&mut self, key: &[u8]) {
+        self.writes.insert(key.to_vec(), None);
+    }
+
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(v) = self.writes.get(key) {
+            return Ok(v.clone());
+        }
+        let state = self
+            .db
+            .inner
+            .state
+            .lock()
+            .map_err(|_| Error::Corruption("state lock poisoned"))?;
+        Ok(read_visible(&state, key, self.snapshot_ts))
+    }
+
+    pub fn commit(&mut self) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+
+        let mut ordered: Vec<_> = self.writes.iter().collect();
+        ordered.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+
+        let _commit_guard = self
+            .db
+            .inner
+            .commit_lock
+            .lock()
+            .map_err(|_| Error::Corruption("commit lock poisoned"))?;
+
+        let commit_ts = {
+            let state = self
+                .db
+                .inner
+                .state
+                .lock()
+                .map_err(|_| Error::Corruption("state lock poisoned"))?;
+            for (key, _) in &ordered {
+                let latest = latest_commit_ts_for_key(&state, key);
+                if latest > self.snapshot_ts {
+                    return Err(Error::Conflict(format!(
+                        "write-write conflict for key {:?}",
+                        String::from_utf8_lossy(key)
+                    )));
+                }
+            }
+            state.last_commit_ts + 1
+        };
+
+        {
+            let mut wal = self
+                .db
+                .inner
+                .wal
+                .lock()
+                .map_err(|_| Error::Corruption("wal lock poisoned"))?;
+            for (key, value) in &ordered {
+                match value {
+                    Some(v) => wal.append(&Record::Set {
+                        tx_id: self.tx_id,
+                        key: (*key).clone(),
+                        value: v.clone(),
+                    })?,
+                    None => wal.append(&Record::Delete {
+                        tx_id: self.tx_id,
+                        key: (*key).clone(),
+                    })?,
+                }
+            }
+            wal.append(&Record::Commit { tx_id: self.tx_id })?;
+            wal.sync()?;
+        }
+
+        let mut state = self
+            .db
+            .inner
+            .state
+            .lock()
+            .map_err(|_| Error::Corruption("state lock poisoned"))?;
+        for (key, value) in ordered {
+            append_version(&mut state.data, key.clone(), commit_ts, value.clone());
+        }
+        state.last_commit_ts = commit_ts;
+
+        self.closed = true;
+        Ok(())
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        self.closed = true;
+    }
+}
+
+fn load_state_from_manifest(dir: &Path, manifest_path: &Path) -> Result<DbState> {
+    let manifest = read_manifest(manifest_path)?;
+    let mut data: BTreeMap<Vec<u8>, Vec<VersionedValue>> = BTreeMap::new();
+    if let Some(segment_name) = &manifest.current_segment {
+        let segment_path = dir.join(segment_name);
+        if segment_path.exists() {
+            let table = read_table(&segment_path)?;
+            let ts = manifest.last_commit_ts.max(1);
+            for (k, v) in table {
+                append_version(&mut data, k, ts, Some(v));
+            }
+        }
+    }
+    Ok(DbState {
+        data,
+        next_tx_id: manifest.next_tx_id,
+        last_commit_ts: manifest.last_commit_ts,
+    })
+}
+
+fn read_visible(state: &DbState, key: &[u8], snapshot_ts: u64) -> Option<Vec<u8>> {
+    let versions = state.data.get(key)?;
+    for version in versions.iter().rev() {
+        if version.commit_ts <= snapshot_ts {
+            return version.value.clone();
+        }
+    }
+    None
+}
+
+fn latest_commit_ts_for_key(state: &DbState, key: &[u8]) -> u64 {
+    state
+        .data
+        .get(key)
+        .and_then(|v| v.last().map(|x| x.commit_ts))
+        .unwrap_or(0)
+}
+
+fn append_version(
+    data: &mut BTreeMap<Vec<u8>, Vec<VersionedValue>>,
+    key: Vec<u8>,
+    commit_ts: u64,
+    value: Option<Vec<u8>>,
+) {
+    data.entry(key).or_default().push(VersionedValue { commit_ts, value });
+}
+
+fn apply_record_for_recovery(
+    state: &mut DbState,
+    pending: &mut HashMap<u64, Vec<Record>>,
+    record: Record,
+) -> Result<()> {
+    match record {
+        Record::Begin { tx_id } => {
+            pending.entry(tx_id).or_default();
+        }
+        Record::Set { tx_id, .. } | Record::Delete { tx_id, .. } => {
+            pending.entry(tx_id).or_default().push(record);
+        }
+        Record::Commit { tx_id } => {
+            if let Some(records) = pending.remove(&tx_id) {
+                state.last_commit_ts += 1;
+                let commit_ts = state.last_commit_ts;
+                for rec in records {
+                    match rec {
+                        Record::Set { key, value, .. } => {
+                            append_version(&mut state.data, key, commit_ts, Some(value));
+                        }
+                        Record::Delete { key, .. } => {
+                            append_version(&mut state.data, key, commit_ts, None);
+                        }
+                        _ => return Err(Error::Corruption("unexpected record in tx body")),
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn record_tx_id(record: &Record) -> u64 {
+    match record {
+        Record::Begin { tx_id } => *tx_id,
+        Record::Set { tx_id, .. } => *tx_id,
+        Record::Delete { tx_id, .. } => *tx_id,
+        Record::Commit { tx_id } => *tx_id,
+    }
+}
+
+fn materialize_latest(data: &BTreeMap<Vec<u8>, Vec<VersionedValue>>) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    for (key, versions) in data {
+        if let Some(v) = versions.last().and_then(|x| x.value.clone()) {
+            out.insert(key.clone(), v);
+        }
+    }
+    out
+}
+
+fn read_legacy_snapshot(path: &Path) -> Result<DbState> {
+    let mut file = File::open(path)?;
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic)?;
+    match &magic {
+        b"TDBSNAP2" => read_legacy_snapshot_v2(file),
+        b"TDBSNAP1" => read_legacy_snapshot_v1(file),
+        _ => Err(Error::Corruption("snapshot magic mismatch")),
+    }
+}
+
+fn read_legacy_snapshot_v2(mut file: File) -> Result<DbState> {
+    let mut commit_bytes = [0u8; 8];
+    let mut next_tx_bytes = [0u8; 8];
+    let mut count_bytes = [0u8; 8];
+    file.read_exact(&mut commit_bytes)?;
+    file.read_exact(&mut next_tx_bytes)?;
+    file.read_exact(&mut count_bytes)?;
+
+    let last_commit_ts = u64::from_le_bytes(commit_bytes);
+    let next_tx_id = u64::from_le_bytes(next_tx_bytes);
+    let count = u64::from_le_bytes(count_bytes);
+
+    let mut data = BTreeMap::new();
+    for _ in 0..count {
+        let (k, v) = read_entry(&mut file)?;
+        append_version(&mut data, k, last_commit_ts.max(1), Some(v));
+    }
+    Ok(DbState {
+        data,
+        next_tx_id,
+        last_commit_ts,
+    })
+}
+
+fn read_legacy_snapshot_v1(mut file: File) -> Result<DbState> {
+    let mut count_bytes = [0u8; 8];
+    file.read_exact(&mut count_bytes)?;
+    let count = u64::from_le_bytes(count_bytes);
+    let mut data = BTreeMap::new();
+    for _ in 0..count {
+        let (k, v) = read_entry(&mut file)?;
+        append_version(&mut data, k, 1, Some(v));
+    }
+    Ok(DbState {
+        data,
+        next_tx_id: 0,
+        last_commit_ts: if count > 0 { 1 } else { 0 },
+    })
+}
+
+fn read_entry(file: &mut File) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut kb = [0u8; 4];
+    let mut vb = [0u8; 4];
+    file.read_exact(&mut kb)?;
+    file.read_exact(&mut vb)?;
+    let klen = u32::from_le_bytes(kb) as usize;
+    let vlen = u32::from_le_bytes(vb) as usize;
+    let mut k = vec![0; klen];
+    let mut v = vec![0; vlen];
+    file.read_exact(&mut k)?;
+    file.read_exact(&mut v)?;
+    Ok((k, v))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("tinydatabase-{name}-{stamp}"))
+    }
+
+    #[test]
+    fn basic_set_get_delete() {
+        let dir = unique_dir("basic");
+        let db = Database::open(&dir).expect("open");
+        db.set(b"a", b"1").expect("set");
+        assert_eq!(db.get(b"a").expect("get"), Some(b"1".to_vec()));
+        db.delete(b"a").expect("delete");
+        assert_eq!(db.get(b"a").expect("get"), None);
+    }
+
+    #[test]
+    fn recover_after_reopen() {
+        let dir = unique_dir("recover");
+        {
+            let db = Database::open(&dir).expect("open");
+            db.set(b"k1", b"v1").expect("set");
+            db.set(b"k2", b"v2").expect("set");
+        }
+        {
+            let db = Database::open(&dir).expect("reopen");
+            assert_eq!(db.get(b"k1").expect("get"), Some(b"v1".to_vec()));
+            assert_eq!(db.get(b"k2").expect("get"), Some(b"v2".to_vec()));
+        }
+    }
+
+    #[test]
+    fn rollback_uncommitted_tx() {
+        let dir = unique_dir("rollback");
+        let db = Database::open(&dir).expect("open");
+        {
+            let mut tx = db.begin_tx().expect("begin");
+            tx.set(b"x", b"1");
+        }
+        let db2 = Database::open(&dir).expect("reopen");
+        assert_eq!(db2.get(b"x").expect("get"), None);
+    }
+
+    #[test]
+    fn checkpoint_roundtrip() {
+        let dir = unique_dir("checkpoint");
+        let db = Database::open(&dir).expect("open");
+        db.set(b"a", b"10").expect("set");
+        db.set(b"b", b"20").expect("set");
+        db.checkpoint().expect("checkpoint");
+        let db2 = Database::open(&dir).expect("reopen");
+        assert_eq!(db2.get(b"a").expect("get"), Some(b"10".to_vec()));
+        assert_eq!(db2.get(b"b").expect("get"), Some(b"20".to_vec()));
+    }
+
+    #[test]
+    fn snapshot_read_stability() {
+        let dir = unique_dir("snapshot");
+        let db = Database::open(&dir).expect("open");
+        db.set(b"k", b"v1").expect("set");
+        let tx = db.begin_tx().expect("begin");
+        db.set(b"k", b"v2").expect("set");
+        assert_eq!(tx.get(b"k").expect("tx get"), Some(b"v1".to_vec()));
+        assert_eq!(db.get(b"k").expect("db get"), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn write_conflict_detection() {
+        let dir = unique_dir("conflict");
+        let db = Database::open(&dir).expect("open");
+        db.set(b"c", b"1").expect("seed");
+
+        let mut tx1 = db.begin_tx().expect("tx1");
+        let mut tx2 = db.begin_tx().expect("tx2");
+        tx1.set(b"c", b"2");
+        tx2.set(b"c", b"3");
+        tx1.commit().expect("commit tx1");
+        let err = tx2.commit().expect_err("must conflict");
+        assert!(matches!(err, Error::Conflict(_)));
+    }
+
+    #[test]
+    fn checkpoint_creates_manifest_and_segment() {
+        let dir = unique_dir("segment");
+        let db = Database::open(&dir).expect("open");
+        db.set(b"alpha", b"1").expect("set");
+        db.checkpoint().expect("checkpoint");
+        assert!(dir.join("MANIFEST").exists());
+        let manifest = read_manifest(&dir.join("MANIFEST")).expect("manifest");
+        let seg = manifest.current_segment.expect("segment name");
+        assert!(dir.join(seg).exists());
+    }
+}
