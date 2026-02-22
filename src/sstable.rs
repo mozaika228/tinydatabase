@@ -1,13 +1,18 @@
 use crate::error::{Error, Result};
 use std::collections::BTreeMap;
+use std::hash::Hasher;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
 
 const SST_MAGIC_V1: &[u8; 8] = b"TDBSST01";
 const SST_MAGIC_V2: &[u8; 8] = b"TDBSST02";
+const IDX_MAGIC_V1: &[u8; 8] = b"TDBIDX01";
 const MANIFEST_MAGIC_V1: &[u8; 8] = b"TDBMAN01";
 const MANIFEST_MAGIC_V2: &[u8; 8] = b"TDBMAN02";
+const BLOOM_BITS: usize = 2048;
+const BLOOM_BYTES: usize = BLOOM_BITS / 8;
+const BLOOM_HASHES: u64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct Manifest {
@@ -15,6 +20,13 @@ pub struct Manifest {
     pub next_tx_id: u64,
     pub last_flushed_commit_ts: u64,
     pub segments: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SegmentMeta {
+    pub min_key: Option<Vec<u8>>,
+    pub max_key: Option<Vec<u8>>,
+    pub bloom: [u8; BLOOM_BYTES],
 }
 
 pub fn write_table(path: &Path, data: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> Result<()> {
@@ -61,6 +73,84 @@ pub fn read_value(path: &Path, lookup_key: &[u8]) -> Result<Option<Option<Vec<u8
         SST_MAGIC_V1 => read_value_v1(file, lookup_key),
         _ => Err(Error::Corruption("sstable magic mismatch")),
     }
+}
+
+pub fn build_segment_meta(data: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> SegmentMeta {
+    let min_key = data.keys().next().cloned();
+    let max_key = data.keys().next_back().cloned();
+    let mut bloom = [0u8; BLOOM_BYTES];
+    for key in data.keys() {
+        for i in 0..BLOOM_HASHES {
+            let bit = bloom_hash(key, i) as usize % BLOOM_BITS;
+            bloom[bit / 8] |= 1u8 << (bit % 8);
+        }
+    }
+    SegmentMeta {
+        min_key,
+        max_key,
+        bloom,
+    }
+}
+
+pub fn may_contain_key(meta: &SegmentMeta, lookup_key: &[u8]) -> bool {
+    let Some(min_key) = &meta.min_key else {
+        return false;
+    };
+    let Some(max_key) = &meta.max_key else {
+        return false;
+    };
+    if lookup_key < min_key.as_slice() || lookup_key > max_key.as_slice() {
+        return false;
+    }
+    for i in 0..BLOOM_HASHES {
+        let bit = bloom_hash(lookup_key, i) as usize % BLOOM_BITS;
+        if (meta.bloom[bit / 8] & (1u8 << (bit % 8))) == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn write_index(path: &Path, meta: &SegmentMeta) -> Result<()> {
+    let mut file = File::create(path)?;
+    file.write_all(IDX_MAGIC_V1)?;
+    match &meta.min_key {
+        Some(min_key) => {
+            file.write_all(&[1])?;
+            file.write_all(&(min_key.len() as u32).to_le_bytes())?;
+            file.write_all(min_key)?;
+        }
+        None => file.write_all(&[0])?,
+    }
+    match &meta.max_key {
+        Some(max_key) => {
+            file.write_all(&[1])?;
+            file.write_all(&(max_key.len() as u32).to_le_bytes())?;
+            file.write_all(max_key)?;
+        }
+        None => file.write_all(&[0])?,
+    }
+    file.write_all(&meta.bloom)?;
+    file.sync_data()?;
+    Ok(())
+}
+
+pub fn read_index(path: &Path) -> Result<SegmentMeta> {
+    let mut file = File::open(path)?;
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic)?;
+    if &magic != IDX_MAGIC_V1 {
+        return Err(Error::Corruption("index magic mismatch"));
+    }
+    let min_key = read_optional_key(&mut file)?;
+    let max_key = read_optional_key(&mut file)?;
+    let mut bloom = [0u8; BLOOM_BYTES];
+    file.read_exact(&mut bloom)?;
+    Ok(SegmentMeta {
+        min_key,
+        max_key,
+        bloom,
+    })
 }
 
 pub fn write_manifest(path: &Path, manifest: &Manifest) -> Result<()> {
@@ -255,6 +345,23 @@ fn read_segment_name(file: &mut File) -> Result<String> {
         .map_err(|_| Error::InvalidData("manifest segment name is not utf-8".to_string()))
 }
 
+fn read_optional_key(file: &mut File) -> Result<Option<Vec<u8>>> {
+    let mut flag = [0u8; 1];
+    file.read_exact(&mut flag)?;
+    if flag[0] == 0 {
+        return Ok(None);
+    }
+    if flag[0] != 1 {
+        return Err(Error::Corruption("index optional key flag is invalid"));
+    }
+    let mut len_bytes = [0u8; 4];
+    file.read_exact(&mut len_bytes)?;
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    let mut out = vec![0u8; len];
+    file.read_exact(&mut out)?;
+    Ok(Some(out))
+}
+
 fn read_v1_entry(file: &mut File) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut kb = [0u8; 4];
     let mut vb = [0u8; 4];
@@ -281,4 +388,11 @@ fn read_v1_entry_reader<R: Read>(reader: &mut R) -> Result<(Vec<u8>, Vec<u8>)> {
     reader.read_exact(&mut k)?;
     reader.read_exact(&mut v)?;
     Ok((k, v))
+}
+
+fn bloom_hash(key: &[u8], seed: u64) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write_u64(seed);
+    hasher.write(key);
+    hasher.finish()
 }

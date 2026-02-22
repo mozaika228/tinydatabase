@@ -24,6 +24,7 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
   - tombstones are persisted in SSTable
   - simple compaction when segment count grows
   - read path: memtable + disk merge (`newest -> oldest` segments)
+  - phase 2.2: per-segment index sidecar (`min/max key` + bloom filter)
 - Recovery on startup from manifest/segments + WAL replay
 
 ## API
@@ -46,6 +47,10 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
   - `magic: "TDBSST02"` (`TDBSST01` reader kept for compatibility)
   - `count: u64`
   - repeated entries: `key_len`, tombstone flag, `value_len`, key, value?
+- Segment index sidecar:
+  - `magic: "TDBIDX01"`
+  - optional `min_key` / `max_key`
+  - fixed bloom filter bitmap
 - Manifest:
   - `magic: "TDBMAN02"` (`TDBMAN01` reader kept for compatibility)
   - `last_commit_ts: u64`
@@ -58,7 +63,7 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
 ## Next milestones
 
 1. Leveling strategy (L0/L1...) instead of single segment list
-2. Sparse index / bloom filters to avoid scanning many segments
+2. Tune bloom/filter sizing and add false-positive telemetry
 3. Background compaction + tombstone GC policy by age/level
 4. Crash tests with process kill during write/checkpoint
 5. Reader/writer stress tests (`loom`/property tests)

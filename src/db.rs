@@ -1,6 +1,9 @@
 use crate::error::{Error, Result};
 use crate::format::Record;
-use crate::sstable::{read_manifest, read_table, read_value, write_manifest, write_table, Manifest};
+use crate::sstable::{
+    build_segment_meta, may_contain_key, read_index, read_manifest, read_table, read_value,
+    write_index, write_manifest, write_table, Manifest, SegmentMeta,
+};
 use crate::wal::Wal;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
@@ -22,7 +25,13 @@ struct DbState {
     next_tx_id: u64,
     last_commit_ts: u64,
     last_flushed_commit_ts: u64,
-    segments: Vec<String>, // oldest -> newest
+    segments: Vec<SegmentEntry>, // oldest -> newest
+}
+
+#[derive(Clone)]
+struct SegmentEntry {
+    name: String,
+    meta: SegmentMeta,
 }
 
 struct DbInner {
@@ -162,7 +171,7 @@ impl Database {
         if !delta.is_empty() {
             let segment_name = format!("segment-{:020}.sst", state.last_commit_ts);
             write_segment_atomically(&self.inner.dir, &segment_name, &delta)?;
-            state.segments.push(segment_name);
+            state.segments.push(load_segment_entry(&self.inner.dir, &segment_name)?);
             state.last_flushed_commit_ts = state.last_commit_ts;
         }
 
@@ -171,12 +180,16 @@ impl Database {
             let compact_data = build_compaction_view(&self.inner.dir, &state.segments, &state.data)?;
             write_segment_atomically(&self.inner.dir, &compact_name, &compact_data)?;
             for old in &state.segments {
-                let old_path = self.inner.dir.join(old);
+                let old_path = self.inner.dir.join(&old.name);
+                let old_idx = self.inner.dir.join(format!("{}.idx", &old.name));
                 if old_path.exists() {
                     let _ = fs::remove_file(old_path);
                 }
+                if old_idx.exists() {
+                    let _ = fs::remove_file(old_idx);
+                }
             }
-            state.segments = vec![compact_name];
+            state.segments = vec![load_segment_entry(&self.inner.dir, &compact_name)?];
         }
 
         let manifest_tmp = self.inner.dir.join("MANIFEST.tmp");
@@ -184,7 +197,7 @@ impl Database {
             last_commit_ts: state.last_commit_ts,
             next_tx_id: state.next_tx_id,
             last_flushed_commit_ts: state.last_flushed_commit_ts,
-            segments: state.segments.clone(),
+            segments: state.segments.iter().map(|x| x.name.clone()).collect(),
         };
         write_manifest(&manifest_tmp, &manifest)?;
         fs::rename(&manifest_tmp, &self.inner.manifest_path)?;
@@ -324,26 +337,38 @@ fn write_segment_atomically(
     let tmp_name = format!("{segment_name}.tmp");
     let tmp_path = dir.join(&tmp_name);
     let segment_path = dir.join(segment_name);
+    let idx_name = format!("{segment_name}.idx");
+    let idx_tmp_name = format!("{idx_name}.tmp");
+    let idx_tmp_path = dir.join(&idx_tmp_name);
+    let idx_path = dir.join(&idx_name);
     write_table(&tmp_path, data)?;
+    let meta = build_segment_meta(data);
+    write_index(&idx_tmp_path, &meta)?;
     if segment_path.exists() {
         fs::remove_file(&segment_path)?;
     }
+    if idx_path.exists() {
+        fs::remove_file(&idx_path)?;
+    }
     fs::rename(&tmp_path, &segment_path)?;
+    fs::rename(&idx_tmp_path, &idx_path)?;
     Ok(())
 }
 
 fn load_state_from_manifest(dir: &Path, manifest_path: &Path) -> Result<DbState> {
     let manifest = read_manifest(manifest_path)?;
+    let mut segments = Vec::new();
+    for name in manifest.segments {
+        if dir.join(&name).exists() {
+            segments.push(load_segment_entry(dir, &name)?);
+        }
+    }
     Ok(DbState {
         data: BTreeMap::new(),
         next_tx_id: manifest.next_tx_id,
         last_commit_ts: manifest.last_commit_ts,
         last_flushed_commit_ts: manifest.last_flushed_commit_ts,
-        segments: manifest
-            .segments
-            .into_iter()
-            .filter(|name| dir.join(name).exists())
-            .collect(),
+        segments,
     })
 }
 
@@ -383,11 +408,14 @@ fn read_visible_in_mem(state: &DbState, key: &[u8], snapshot_ts: u64) -> MemRead
 
 fn read_from_segments(
     dir: &Path,
-    segments: &[String],
+    segments: &[SegmentEntry],
     key: &[u8],
 ) -> Result<Option<Option<Vec<u8>>>> {
     for segment in segments.iter().rev() {
-        let path = dir.join(segment);
+        if !may_contain_key(&segment.meta, key) {
+            continue;
+        }
+        let path = dir.join(&segment.name);
         if !path.exists() {
             continue;
         }
@@ -455,12 +483,12 @@ fn materialize_delta_since(
 
 fn build_compaction_view(
     dir: &Path,
-    segments: &[String],
+    segments: &[SegmentEntry],
     mem: &BTreeMap<Vec<u8>, Vec<VersionedValue>>,
 ) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>> {
     let mut out = BTreeMap::new();
     for segment in segments {
-        let path = dir.join(segment);
+        let path = dir.join(&segment.name);
         if !path.exists() {
             continue;
         }
@@ -475,6 +503,20 @@ fn build_compaction_view(
         }
     }
     Ok(out)
+}
+
+fn load_segment_entry(dir: &Path, name: &str) -> Result<SegmentEntry> {
+    let idx_path = dir.join(format!("{name}.idx"));
+    let meta = if idx_path.exists() {
+        read_index(&idx_path)?
+    } else {
+        let table = read_table(&dir.join(name))?;
+        build_segment_meta(&table)
+    };
+    Ok(SegmentEntry {
+        name: name.to_string(),
+        meta,
+    })
 }
 
 fn read_legacy_snapshot(path: &Path) -> Result<DbState> {
@@ -645,6 +687,7 @@ mod tests {
         let manifest = read_manifest(&dir.join("MANIFEST")).expect("manifest");
         assert_eq!(manifest.segments.len(), 1);
         assert!(dir.join(&manifest.segments[0]).exists());
+        assert!(dir.join(format!("{}.idx", &manifest.segments[0])).exists());
     }
 
     #[test]
