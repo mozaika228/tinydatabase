@@ -18,11 +18,13 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
   - transaction reads are stable against later commits
   - write-write conflicts are detected on commit
 - In-memory versioned index (BTreeMap + versions)
-- LSM phase 1:
-  - immutable SSTable segment (`segment-*.sst`)
-  - `MANIFEST` points to active segment and metadata
-  - checkpoint writes segment + manifest and truncates WAL
-- Recovery on startup from manifest/segment + WAL replay
+- LSM phase 2:
+  - multiple immutable SSTable segments
+  - delta flush on checkpoint (only changes since last flush)
+  - tombstones are persisted in SSTable
+  - simple compaction when segment count grows
+  - read path: memtable + disk merge (`newest -> oldest` segments)
+- Recovery on startup from manifest/segments + WAL replay
 
 ## API
 
@@ -41,21 +43,22 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
   - `crc32(payload): u32`
   - `payload: bytes`
 - SSTable:
-  - `magic: "TDBSST01"`
+  - `magic: "TDBSST02"` (`TDBSST01` reader kept for compatibility)
   - `count: u64`
-  - repeated key/value entries with `u32` lengths
+  - repeated entries: `key_len`, tombstone flag, `value_len`, key, value?
 - Manifest:
-  - `magic: "TDBMAN01"`
+  - `magic: "TDBMAN02"` (`TDBMAN01` reader kept for compatibility)
   - `last_commit_ts: u64`
   - `next_tx_id: u64`
-  - active segment name (optional)
+  - `last_flushed_commit_ts: u64`
+  - list of segment names (oldest -> newest)
 - Legacy snapshot reader:
   - `TDBSNAP1`/`TDBSNAP2` can still be loaded for migration
 
 ## Next milestones
 
-1. Multiple SSTables + read merge across levels
-2. Background compaction + tombstone GC
-3. Crash tests with process kill during write/checkpoint
-4. Reader/writer stress tests (`loom`/property tests)
-5. Benchmarks and tuning (Bloom filter, compression)
+1. Leveling strategy (L0/L1...) instead of single segment list
+2. Sparse index / bloom filters to avoid scanning many segments
+3. Background compaction + tombstone GC policy by age/level
+4. Crash tests with process kill during write/checkpoint
+5. Reader/writer stress tests (`loom`/property tests)

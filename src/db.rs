@@ -1,12 +1,14 @@
 use crate::error::{Error, Result};
 use crate::format::Record;
-use crate::sstable::{read_manifest, read_table, write_manifest, write_table, Manifest};
+use crate::sstable::{read_manifest, read_table, read_value, write_manifest, write_table, Manifest};
 use crate::wal::Wal;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+const MAX_SEGMENTS_BEFORE_COMPACT: usize = 4;
 
 #[derive(Clone)]
 struct VersionedValue {
@@ -19,6 +21,8 @@ struct DbState {
     data: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
     next_tx_id: u64,
     last_commit_ts: u64,
+    last_flushed_commit_ts: u64,
+    segments: Vec<String>, // oldest -> newest
 }
 
 struct DbInner {
@@ -88,7 +92,18 @@ impl Database {
             .lock()
             .map_err(|_| Error::Corruption("state lock poisoned"))?;
         let snapshot_ts = state.last_commit_ts;
-        Ok(read_visible(&state, key, snapshot_ts))
+        let mem_read = read_visible_in_mem(&state, key, snapshot_ts);
+        let segments = state.segments.clone();
+        drop(state);
+        match mem_read {
+            MemRead::Found(v) => Ok(v),
+            MemRead::NotPresent => {
+                match read_from_segments(&self.inner.dir, &segments, key)? {
+                    Some(v) => Ok(v),
+                    None => Ok(None),
+                }
+            }
+        }
     }
 
     pub fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -137,47 +152,43 @@ impl Database {
             .lock()
             .map_err(|_| Error::Corruption("commit lock poisoned"))?;
 
-        let state = self
+        let mut state = self
             .inner
             .state
             .lock()
             .map_err(|_| Error::Corruption("state lock poisoned"))?;
 
-        let materialized = materialize_latest(&state.data);
-        let segment_name = format!("segment-{:020}.sst", state.last_commit_ts);
-        let segment_tmp_name = format!("{segment_name}.tmp");
-        let segment_tmp_path = self.inner.dir.join(&segment_tmp_name);
-        let segment_path = self.inner.dir.join(&segment_name);
-        write_table(&segment_tmp_path, &materialized)?;
-        if segment_path.exists() {
-            fs::remove_file(&segment_path)?;
+        let delta = materialize_delta_since(&state.data, state.last_flushed_commit_ts);
+        if !delta.is_empty() {
+            let segment_name = format!("segment-{:020}.sst", state.last_commit_ts);
+            write_segment_atomically(&self.inner.dir, &segment_name, &delta)?;
+            state.segments.push(segment_name);
+            state.last_flushed_commit_ts = state.last_commit_ts;
         }
-        fs::rename(&segment_tmp_path, &segment_path)?;
 
-        let previous_segment = if self.inner.manifest_path.exists() {
-            read_manifest(&self.inner.manifest_path)?.current_segment
-        } else {
-            None
-        };
-
-        let manifest_tmp = self.inner.dir.join("MANIFEST.tmp");
-        let manifest = Manifest {
-            last_commit_ts: state.last_commit_ts,
-            next_tx_id: state.next_tx_id,
-            current_segment: Some(segment_name.clone()),
-        };
-        write_manifest(&manifest_tmp, &manifest)?;
-        fs::rename(&manifest_tmp, &self.inner.manifest_path)?;
-        drop(state);
-
-        if let Some(old) = previous_segment {
-            if old != segment_name {
+        if state.segments.len() > MAX_SEGMENTS_BEFORE_COMPACT {
+            let compact_name = format!("compact-{:020}.sst", state.last_commit_ts);
+            let compact_data = build_compaction_view(&self.inner.dir, &state.segments, &state.data)?;
+            write_segment_atomically(&self.inner.dir, &compact_name, &compact_data)?;
+            for old in &state.segments {
                 let old_path = self.inner.dir.join(old);
                 if old_path.exists() {
                     let _ = fs::remove_file(old_path);
                 }
             }
+            state.segments = vec![compact_name];
         }
+
+        let manifest_tmp = self.inner.dir.join("MANIFEST.tmp");
+        let manifest = Manifest {
+            last_commit_ts: state.last_commit_ts,
+            next_tx_id: state.next_tx_id,
+            last_flushed_commit_ts: state.last_flushed_commit_ts,
+            segments: state.segments.clone(),
+        };
+        write_manifest(&manifest_tmp, &manifest)?;
+        fs::rename(&manifest_tmp, &self.inner.manifest_path)?;
+        drop(state);
 
         let mut wal = self
             .inner
@@ -209,7 +220,20 @@ impl Transaction {
             .state
             .lock()
             .map_err(|_| Error::Corruption("state lock poisoned"))?;
-        Ok(read_visible(&state, key, self.snapshot_ts))
+        let mem_read = read_visible_in_mem(&state, key, self.snapshot_ts);
+        let segments = state.segments.clone();
+        let visible_flushed = self.snapshot_ts >= state.last_flushed_commit_ts;
+        drop(state);
+        match mem_read {
+            MemRead::Found(v) => Ok(v),
+            MemRead::NotPresent if visible_flushed => {
+                match read_from_segments(&self.db.inner.dir, &segments, key)? {
+                    Some(v) => Ok(v),
+                    None => Ok(None),
+                }
+            }
+            MemRead::NotPresent => Ok(None),
+        }
     }
 
     pub fn commit(&mut self) -> Result<()> {
@@ -292,34 +316,35 @@ impl Drop for Transaction {
     }
 }
 
-fn load_state_from_manifest(dir: &Path, manifest_path: &Path) -> Result<DbState> {
-    let manifest = read_manifest(manifest_path)?;
-    let mut data: BTreeMap<Vec<u8>, Vec<VersionedValue>> = BTreeMap::new();
-    if let Some(segment_name) = &manifest.current_segment {
-        let segment_path = dir.join(segment_name);
-        if segment_path.exists() {
-            let table = read_table(&segment_path)?;
-            let ts = manifest.last_commit_ts.max(1);
-            for (k, v) in table {
-                append_version(&mut data, k, ts, Some(v));
-            }
-        }
+fn write_segment_atomically(
+    dir: &Path,
+    segment_name: &str,
+    data: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+) -> Result<()> {
+    let tmp_name = format!("{segment_name}.tmp");
+    let tmp_path = dir.join(&tmp_name);
+    let segment_path = dir.join(segment_name);
+    write_table(&tmp_path, data)?;
+    if segment_path.exists() {
+        fs::remove_file(&segment_path)?;
     }
-    Ok(DbState {
-        data,
-        next_tx_id: manifest.next_tx_id,
-        last_commit_ts: manifest.last_commit_ts,
-    })
+    fs::rename(&tmp_path, &segment_path)?;
+    Ok(())
 }
 
-fn read_visible(state: &DbState, key: &[u8], snapshot_ts: u64) -> Option<Vec<u8>> {
-    let versions = state.data.get(key)?;
-    for version in versions.iter().rev() {
-        if version.commit_ts <= snapshot_ts {
-            return version.value.clone();
-        }
-    }
-    None
+fn load_state_from_manifest(dir: &Path, manifest_path: &Path) -> Result<DbState> {
+    let manifest = read_manifest(manifest_path)?;
+    Ok(DbState {
+        data: BTreeMap::new(),
+        next_tx_id: manifest.next_tx_id,
+        last_commit_ts: manifest.last_commit_ts,
+        last_flushed_commit_ts: manifest.last_flushed_commit_ts,
+        segments: manifest
+            .segments
+            .into_iter()
+            .filter(|name| dir.join(name).exists())
+            .collect(),
+    })
 }
 
 fn latest_commit_ts_for_key(state: &DbState, key: &[u8]) -> u64 {
@@ -337,6 +362,40 @@ fn append_version(
     value: Option<Vec<u8>>,
 ) {
     data.entry(key).or_default().push(VersionedValue { commit_ts, value });
+}
+
+enum MemRead {
+    Found(Option<Vec<u8>>),
+    NotPresent,
+}
+
+fn read_visible_in_mem(state: &DbState, key: &[u8], snapshot_ts: u64) -> MemRead {
+    let Some(versions) = state.data.get(key) else {
+        return MemRead::NotPresent;
+    };
+    for version in versions.iter().rev() {
+        if version.commit_ts <= snapshot_ts {
+            return MemRead::Found(version.value.clone());
+        }
+    }
+    MemRead::NotPresent
+}
+
+fn read_from_segments(
+    dir: &Path,
+    segments: &[String],
+    key: &[u8],
+) -> Result<Option<Option<Vec<u8>>>> {
+    for segment in segments.iter().rev() {
+        let path = dir.join(segment);
+        if !path.exists() {
+            continue;
+        }
+        if let Some(v) = read_value(&path, key)? {
+            return Ok(Some(v));
+        }
+    }
+    Ok(None)
 }
 
 fn apply_record_for_recovery(
@@ -381,14 +440,41 @@ fn record_tx_id(record: &Record) -> u64 {
     }
 }
 
-fn materialize_latest(data: &BTreeMap<Vec<u8>, Vec<VersionedValue>>) -> BTreeMap<Vec<u8>, Vec<u8>> {
+fn materialize_delta_since(
+    data: &BTreeMap<Vec<u8>, Vec<VersionedValue>>,
+    from_commit_ts: u64,
+) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
     let mut out = BTreeMap::new();
     for (key, versions) in data {
-        if let Some(v) = versions.last().and_then(|x| x.value.clone()) {
-            out.insert(key.clone(), v);
+        if let Some(v) = versions.iter().rev().find(|x| x.commit_ts > from_commit_ts) {
+            out.insert(key.clone(), v.value.clone());
         }
     }
     out
+}
+
+fn build_compaction_view(
+    dir: &Path,
+    segments: &[String],
+    mem: &BTreeMap<Vec<u8>, Vec<VersionedValue>>,
+) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>> {
+    let mut out = BTreeMap::new();
+    for segment in segments {
+        let path = dir.join(segment);
+        if !path.exists() {
+            continue;
+        }
+        let table = read_table(&path)?;
+        for (k, v) in table {
+            out.insert(k, v);
+        }
+    }
+    for (k, versions) in mem {
+        if let Some(v) = versions.last() {
+            out.insert(k.clone(), v.value.clone());
+        }
+    }
+    Ok(out)
 }
 
 fn read_legacy_snapshot(path: &Path) -> Result<DbState> {
@@ -423,6 +509,8 @@ fn read_legacy_snapshot_v2(mut file: File) -> Result<DbState> {
         data,
         next_tx_id,
         last_commit_ts,
+        last_flushed_commit_ts: last_commit_ts,
+        segments: Vec::new(),
     })
 }
 
@@ -435,10 +523,13 @@ fn read_legacy_snapshot_v1(mut file: File) -> Result<DbState> {
         let (k, v) = read_entry(&mut file)?;
         append_version(&mut data, k, 1, Some(v));
     }
+    let ts = if count > 0 { 1 } else { 0 };
     Ok(DbState {
         data,
         next_tx_id: 0,
-        last_commit_ts: if count > 0 { 1 } else { 0 },
+        last_commit_ts: ts,
+        last_flushed_commit_ts: ts,
+        segments: Vec::new(),
     })
 }
 
@@ -545,14 +636,46 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_creates_manifest_and_segment() {
+    fn checkpoint_creates_manifest_and_segments() {
         let dir = unique_dir("segment");
         let db = Database::open(&dir).expect("open");
         db.set(b"alpha", b"1").expect("set");
         db.checkpoint().expect("checkpoint");
         assert!(dir.join("MANIFEST").exists());
         let manifest = read_manifest(&dir.join("MANIFEST")).expect("manifest");
-        let seg = manifest.current_segment.expect("segment name");
-        assert!(dir.join(seg).exists());
+        assert_eq!(manifest.segments.len(), 1);
+        assert!(dir.join(&manifest.segments[0]).exists());
+    }
+
+    #[test]
+    fn multiple_checkpoints_keep_multiple_segments() {
+        let dir = unique_dir("multiseg");
+        let db = Database::open(&dir).expect("open");
+        db.set(b"a", b"1").expect("set1");
+        db.checkpoint().expect("cp1");
+        db.set(b"b", b"2").expect("set2");
+        db.checkpoint().expect("cp2");
+        db.set(b"a", b"3").expect("set3");
+        db.checkpoint().expect("cp3");
+
+        let manifest = read_manifest(&dir.join("MANIFEST")).expect("manifest");
+        assert!(manifest.segments.len() >= 2);
+        let reopened = Database::open(&dir).expect("reopen");
+        assert_eq!(reopened.get(b"a").expect("get a"), Some(b"3".to_vec()));
+        assert_eq!(reopened.get(b"b").expect("get b"), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn compaction_caps_segment_count() {
+        let dir = unique_dir("compact");
+        let db = Database::open(&dir).expect("open");
+        for i in 0..7 {
+            let k = format!("k{i}");
+            let v = format!("v{i}");
+            db.set(k.as_bytes(), v.as_bytes()).expect("set");
+            db.checkpoint().expect("checkpoint");
+        }
+        let manifest = read_manifest(&dir.join("MANIFEST")).expect("manifest");
+        assert!(manifest.segments.len() <= MAX_SEGMENTS_BEFORE_COMPACT);
     }
 }
