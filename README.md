@@ -26,6 +26,10 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
   - read path: memtable + disk merge (`newest -> oldest` segments)
   - phase 2.2: per-segment index sidecar (`min/max key` + bloom filter)
 - Recovery on startup from manifest/segments + WAL replay
+- Insane phase 1 (foundation):
+  - replicated log with `index` + `term` + checksums
+  - deterministic state hash from applied commands
+  - chunked snapshot install protocol with integrity check
 
 ## API
 
@@ -35,6 +39,9 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
 - `Database::delete(key)`
 - `Database::begin_tx() -> Transaction`
 - `Database::checkpoint()`
+- `ReplicatedLog::open/append/append_entry/entries_from/truncate_suffix`
+- `SnapshotInstaller::begin` + `SnapshotInstall::append_chunk/finalize`
+- `deterministic_state_hash(entries)`
 
 ## Storage format
 
@@ -57,13 +64,18 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
   - `next_tx_id: u64`
   - `last_flushed_commit_ts: u64`
   - list of segment names (oldest -> newest)
+- Replication log:
+  - frame: `magic`, payload len, crc32, payload
+  - payload: `index`, `term`, command (`set/delete`)
+- Snapshot install temp flow:
+  - write to `*.installing`, validate size + crc, atomic rename
 - Legacy snapshot reader:
   - `TDBSNAP1`/`TDBSNAP2` can still be loaded for migration
 
 ## Next milestones
 
-1. Leveling strategy (L0/L1...) instead of single segment list
-2. Tune bloom/filter sizing and add false-positive telemetry
-3. Background compaction + tombstone GC policy by age/level
-4. Crash tests with process kill during write/checkpoint
-5. Reader/writer stress tests (`loom`/property tests)
+1. Raft protocol layer (leader election, match index, commit index)
+2. Snapshot install over network (streaming + resume)
+3. Serializable isolation (SSI) on top of replicated commits
+4. Background compaction + tombstone GC policy by age/level
+5. Crash/fault matrix (disk + network partitions + node restarts)
