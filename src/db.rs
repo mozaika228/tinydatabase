@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-const MAX_SEGMENTS_BEFORE_COMPACT: usize = 4;
+const L0_COMPACTION_TRIGGER: usize = 4;
+const LEVEL_L0: u8 = 0;
+const LEVEL_L1: u8 = 1;
 
 #[derive(Clone)]
 struct VersionedValue {
@@ -35,6 +37,7 @@ struct DbState {
 #[derive(Clone)]
 struct SegmentEntry {
     name: String,
+    level: u8,
     meta: SegmentMeta,
 }
 
@@ -252,16 +255,18 @@ impl Database {
 
         let delta = materialize_delta_since(&state.data, state.last_flushed_commit_ts);
         if !delta.is_empty() {
-            let segment_name = format!("segment-{:020}.sst", state.last_commit_ts);
+            let segment_name = format!("l0-{:020}.sst", state.last_commit_ts);
             write_segment_atomically(&self.inner.dir, &segment_name, &delta)?;
             state.segments.push(load_segment_entry(&self.inner.dir, &segment_name)?);
             state.last_flushed_commit_ts = state.last_commit_ts;
         }
 
-        if state.segments.len() > MAX_SEGMENTS_BEFORE_COMPACT {
-            let compact_name = format!("compact-{:020}.sst", state.last_commit_ts);
+        let l0_count = state.segments.iter().filter(|s| s.level == LEVEL_L0).count();
+        if l0_count > L0_COMPACTION_TRIGGER {
+            let l1_name = format!("l1-{:020}.sst", state.last_commit_ts);
             let compact_data = build_compaction_view(&self.inner.dir, &state.segments, &state.data)?;
-            write_segment_atomically(&self.inner.dir, &compact_name, &compact_data)?;
+            write_segment_atomically(&self.inner.dir, &l1_name, &compact_data)?;
+
             for old in &state.segments {
                 let old_path = self.inner.dir.join(&old.name);
                 let old_idx = self.inner.dir.join(format!("{}.idx", &old.name));
@@ -272,7 +277,7 @@ impl Database {
                     let _ = fs::remove_file(old_idx);
                 }
             }
-            state.segments = vec![load_segment_entry(&self.inner.dir, &compact_name)?];
+            state.segments = vec![load_segment_entry(&self.inner.dir, &l1_name)?];
         }
 
         let manifest_tmp = self.inner.dir.join("MANIFEST.tmp");
@@ -790,10 +795,22 @@ fn load_segment_entry(dir: &Path, name: &str) -> Result<SegmentEntry> {
         let table = read_table(&dir.join(name))?;
         build_segment_meta(&table)
     };
+    let level = segment_level_from_name(name);
     Ok(SegmentEntry {
         name: name.to_string(),
+        level,
         meta,
     })
+}
+
+fn segment_level_from_name(name: &str) -> u8 {
+    if name.starts_with("l0-") {
+        LEVEL_L0
+    } else if name.starts_with("l1-") {
+        LEVEL_L1
+    } else {
+        LEVEL_L0
+    }
 }
 
 fn read_legacy_snapshot(path: &Path) -> Result<DbState> {
@@ -1002,14 +1019,15 @@ mod tests {
     fn compaction_caps_segment_count() {
         let dir = unique_dir("compact");
         let db = Database::open(&dir).expect("open");
-        for i in 0..7 {
+        for i in 0..(L0_COMPACTION_TRIGGER + 3) {
             let k = format!("k{i}");
             let v = format!("v{i}");
             db.set(k.as_bytes(), v.as_bytes()).expect("set");
             db.checkpoint().expect("checkpoint");
         }
         let manifest = read_manifest(&dir.join("MANIFEST")).expect("manifest");
-        assert!(manifest.segments.len() <= MAX_SEGMENTS_BEFORE_COMPACT);
+        assert_eq!(manifest.segments.len(), 1);
+        assert!(manifest.segments[0].starts_with("l1-"));
     }
 
     #[test]
