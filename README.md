@@ -58,6 +58,7 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
 - `ReplicatedLog::build_append_request/apply_append_request`
 - `RaftNode` + `RaftVoteRequest/Response` + `RaftAppendEntriesRequest/Response`
 - `SnapshotInstaller::begin` + `SnapshotInstall::append_chunk/finalize`
+- `SnapshotSender::from_path/metadata/chunk_at` for streaming + resume
 - `deterministic_state_hash(entries)`
 - `BatchOp::{Put, Delete}`
 

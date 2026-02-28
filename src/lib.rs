@@ -15,6 +15,6 @@ pub use raft::{
 };
 pub use replication::{
     deterministic_state_hash, AppendRequest, AppendResponse, Command, LogEntry, ReplicatedLog,
-    SnapshotInstall, SnapshotInstaller,
+    SnapshotChunk, SnapshotInstall, SnapshotInstaller, SnapshotMetadata, SnapshotSender,
 };
 

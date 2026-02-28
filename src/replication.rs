@@ -210,6 +210,23 @@ pub struct SnapshotInstall {
 
 pub struct SnapshotInstaller;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotMetadata {
+    pub size: u64,
+    pub crc32: u32,
+}
+
+pub struct SnapshotSender {
+    bytes: Vec<u8>,
+    meta: SnapshotMetadata,
+}
+
+pub struct SnapshotChunk {
+    pub offset: u64,
+    pub data: Vec<u8>,
+    pub is_last: bool,
+}
+
 impl SnapshotInstaller {
     pub fn begin(
         target_path: impl AsRef<Path>,
@@ -226,6 +243,39 @@ impl SnapshotInstaller {
             expected_crc,
             written: 0,
             file,
+        })
+    }
+}
+
+impl SnapshotSender {
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let bytes = std::fs::read(path)?;
+        let meta = SnapshotMetadata {
+            size: bytes.len() as u64,
+            crc32: crc32(&bytes),
+        };
+        Ok(Self { bytes, meta })
+    }
+
+    pub fn metadata(&self) -> SnapshotMetadata {
+        self.meta.clone()
+    }
+
+    pub fn chunk_at(&self, offset: u64, chunk_size: usize) -> Result<SnapshotChunk> {
+        if chunk_size == 0 {
+            return Err(Error::InvalidData("chunk_size must be > 0".to_string()));
+        }
+        let start = offset as usize;
+        if start > self.bytes.len() {
+            return Err(Error::InvalidData(format!(
+                "snapshot chunk offset out of range: {offset}"
+            )));
+        }
+        let end = (start + chunk_size).min(self.bytes.len());
+        Ok(SnapshotChunk {
+            offset,
+            data: self.bytes[start..end].to_vec(),
+            is_last: end == self.bytes.len(),
         })
     }
 }
@@ -274,6 +324,10 @@ impl SnapshotInstall {
         }
         fs::rename(&self.tmp_path, &self.target_path)?;
         Ok(())
+    }
+
+    pub fn current_offset(&self) -> u64 {
+        self.written
     }
 }
 
@@ -495,6 +549,42 @@ mod tests {
         install.finalize().expect("finalize");
         let got = std::fs::read(path).expect("read");
         assert_eq!(got, bytes);
+    }
+
+    #[test]
+    fn snapshot_streaming_resume_roundtrip() {
+        let src = unique_file("snapshot-src");
+        let dst = unique_file("snapshot-dst");
+        let mut bytes = Vec::new();
+        for i in 0..50_000usize {
+            bytes.extend_from_slice(format!("line-{i:05}\n").as_bytes());
+        }
+        std::fs::write(&src, &bytes).expect("write src");
+
+        let sender = SnapshotSender::from_path(&src).expect("sender");
+        let meta = sender.metadata();
+        let mut install = SnapshotInstaller::begin(&dst, meta.size, meta.crc32).expect("begin");
+
+        let c1 = sender.chunk_at(0, 4096).expect("chunk1");
+        install.append_chunk(c1.offset, &c1.data).expect("append1");
+        let c2 = sender
+            .chunk_at(install.current_offset(), 2048)
+            .expect("chunk2");
+        install.append_chunk(c2.offset, &c2.data).expect("append2");
+
+        while install.current_offset() < meta.size {
+            let c = sender
+                .chunk_at(install.current_offset(), 8192)
+                .expect("chunk");
+            install.append_chunk(c.offset, &c.data).expect("append");
+            if c.is_last {
+                break;
+            }
+        }
+
+        install.finalize().expect("finalize");
+        let restored = std::fs::read(dst).expect("read dst");
+        assert_eq!(restored, bytes);
     }
 
     #[test]
