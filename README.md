@@ -18,15 +18,15 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
   - transaction reads are stable against later commits
   - write-write conflicts are detected on commit
 - In-memory versioned index (BTreeMap + versions)
-- LSM phase 2:
+- LSM storage engine:
   - multiple immutable SSTable segments
   - delta flush on checkpoint (only changes since last flush)
   - tombstones are persisted in SSTable
   - simple compaction when segment count grows
   - read path: memtable + disk merge (`newest -> oldest` segments)
-  - phase 2.2: per-segment index sidecar (`min/max key` + bloom filter)
+  - per-segment index sidecar (`min/max key` + bloom filter)
 - Recovery on startup from manifest/segments + WAL replay
-- Insane phase 1 (foundation):
+- Replication foundation:
   - replicated log with `index` + `term` + checksums
   - deterministic state hash from applied commands
   - chunked snapshot install protocol with integrity check
@@ -43,6 +43,33 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
 - `SnapshotInstaller::begin` + `SnapshotInstall::append_chunk/finalize`
 - `deterministic_state_hash(entries)`
 
+## C ABI
+
+- Library type: `cdylib`
+- Handle lifecycle:
+  - `tdb_open(path, &handle)`
+  - `tdb_close(handle)`
+- KV operations:
+  - `tdb_set`, `tdb_get`, `tdb_delete`, `tdb_checkpoint`
+- Status codes:
+  - `tdb_status_ok()`
+  - `tdb_status_not_found()`
+  - `tdb_status_null_pointer()`
+  - `tdb_status_invalid_argument()`
+  - `tdb_status_error()`
+  - `tdb_status_conflict()`
+- Error/message and memory ownership:
+  - `tdb_last_error_copy(&ptr, &len)`
+  - `tdb_free_buffer(ptr, len)` for buffers returned by FFI
+- Header: `include/tinydatabase.h`
+- Example client: `examples/c_client.c`
+- Build/run example (Linux/macOS):
+  - `cargo build --release`
+  - `cc examples/c_client.c -Iinclude -Ltarget/release -ltinydatabase -o c_client`
+  - `LD_LIBRARY_PATH=target/release ./c_client`
+- Build/run example (Windows + MSVC):
+  - `cargo build --release`
+  - `cl /I include examples\c_client.c /link /LIBPATH:target\release tinydatabase.dll.lib`
 ## Storage format
 
 - WAL frame:
@@ -79,3 +106,6 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
 3. Serializable isolation (SSI) on top of replicated commits
 4. Background compaction + tombstone GC policy by age/level
 5. Crash/fault matrix (disk + network partitions + node restarts)
+
+
+
