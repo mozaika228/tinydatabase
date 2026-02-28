@@ -22,6 +22,7 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
   - multiple immutable SSTable segments
   - delta flush on checkpoint (only changes since last flush)
   - tombstones are persisted in SSTable
+  - optional zstd compression for SSTable payload
   - simple compaction when segment count grows
   - read path: memtable + disk merge (`newest -> oldest` segments)
   - per-segment index sidecar (`min/max key` + bloom filter)
@@ -86,9 +87,9 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
   - `crc32(payload): u32`
   - `payload: bytes`
 - SSTable:
-  - `magic: "TDBSST02"` (`TDBSST01` reader kept for compatibility)
-  - `count: u64`
-  - repeated entries: `key_len`, tombstone flag, `value_len`, key, value?
+  - `magic: "TDBSST03"` (`TDBSST01/02` readers kept for compatibility)
+  - payload codec: raw or `zstd`
+  - payload entries: `count`, repeated `key_len`, tombstone flag, `value_len`, key, value?
 - Segment index sidecar:
   - `magic: "TDBIDX01"`
   - optional `min_key` / `max_key`

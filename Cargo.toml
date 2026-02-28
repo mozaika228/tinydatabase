@@ -8,3 +8,4 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 crc32fast = "1.4"
+zstd = "0.13"

@@ -7,12 +7,15 @@ use std::path::Path;
 
 const SST_MAGIC_V1: &[u8; 8] = b"TDBSST01";
 const SST_MAGIC_V2: &[u8; 8] = b"TDBSST02";
+const SST_MAGIC_V3: &[u8; 8] = b"TDBSST03";
 const IDX_MAGIC_V1: &[u8; 8] = b"TDBIDX01";
 const MANIFEST_MAGIC_V1: &[u8; 8] = b"TDBMAN01";
 const MANIFEST_MAGIC_V2: &[u8; 8] = b"TDBMAN02";
 const BLOOM_BITS: usize = 2048;
 const BLOOM_BYTES: usize = BLOOM_BITS / 8;
 const BLOOM_HASHES: u64 = 3;
+const CODEC_NONE: u8 = 0;
+const CODEC_ZSTD: u8 = 1;
 
 #[derive(Debug, Clone)]
 pub struct Manifest {
@@ -31,24 +34,18 @@ pub struct SegmentMeta {
 
 pub fn write_table(path: &Path, data: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> Result<()> {
     let mut file = File::create(path)?;
-    file.write_all(SST_MAGIC_V2)?;
-    file.write_all(&(data.len() as u64).to_le_bytes())?;
-    for (key, value) in data {
-        file.write_all(&(key.len() as u32).to_le_bytes())?;
-        match value {
-            Some(v) => {
-                file.write_all(&[0])?;
-                file.write_all(&(v.len() as u32).to_le_bytes())?;
-                file.write_all(key)?;
-                file.write_all(v)?;
-            }
-            None => {
-                file.write_all(&[1])?;
-                file.write_all(&0u32.to_le_bytes())?;
-                file.write_all(key)?;
-            }
-        }
-    }
+    let payload = encode_table_payload(data);
+    let compressed = zstd::stream::encode_all(payload.as_slice(), 1).map_err(Error::Io)?;
+    let (codec, stored) = if compressed.len() < payload.len() {
+        (CODEC_ZSTD, compressed)
+    } else {
+        (CODEC_NONE, payload.clone())
+    };
+    file.write_all(SST_MAGIC_V3)?;
+    file.write_all(&[codec])?;
+    file.write_all(&(payload.len() as u64).to_le_bytes())?;
+    file.write_all(&(stored.len() as u64).to_le_bytes())?;
+    file.write_all(&stored)?;
     file.sync_data()?;
     Ok(())
 }
@@ -58,6 +55,7 @@ pub fn read_table(path: &Path) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>> {
     let mut magic = [0u8; 8];
     file.read_exact(&mut magic)?;
     match &magic {
+        SST_MAGIC_V3 => read_table_v3(file),
         SST_MAGIC_V2 => read_table_v2(file),
         SST_MAGIC_V1 => read_table_v1(file),
         _ => Err(Error::Corruption("sstable magic mismatch")),
@@ -69,6 +67,7 @@ pub fn read_value(path: &Path, lookup_key: &[u8]) -> Result<Option<Option<Vec<u8
     let mut magic = [0u8; 8];
     file.read_exact(&mut magic)?;
     match &magic {
+        SST_MAGIC_V3 => read_value_v3(file, lookup_key),
         SST_MAGIC_V2 => read_value_v2(file, lookup_key),
         SST_MAGIC_V1 => read_value_v1(file, lookup_key),
         _ => Err(Error::Corruption("sstable magic mismatch")),
@@ -213,6 +212,11 @@ fn read_table_v2(mut file: File) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>> {
     Ok(out)
 }
 
+fn read_table_v3(mut file: File) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>> {
+    let payload = read_v3_payload(&mut file)?;
+    decode_table_payload(&payload)
+}
+
 fn read_value_v2(file: File, lookup_key: &[u8]) -> Result<Option<Option<Vec<u8>>>> {
     let mut reader = BufReader::new(file);
     let mut count_bytes = [0u8; 8];
@@ -256,6 +260,11 @@ fn read_value_v2(file: File, lookup_key: &[u8]) -> Result<Option<Option<Vec<u8>>
         }
     }
     Ok(None)
+}
+
+fn read_value_v3(mut file: File, lookup_key: &[u8]) -> Result<Option<Option<Vec<u8>>>> {
+    let payload = read_v3_payload(&mut file)?;
+    read_value_from_payload(&payload, lookup_key)
 }
 
 fn read_table_v1(mut file: File) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>> {
@@ -388,6 +397,142 @@ fn read_v1_entry_reader<R: Read>(reader: &mut R) -> Result<(Vec<u8>, Vec<u8>)> {
     reader.read_exact(&mut k)?;
     reader.read_exact(&mut v)?;
     Ok((k, v))
+}
+
+fn encode_table_payload(data: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    for (key, value) in data {
+        out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        match value {
+            Some(v) => {
+                out.push(0);
+                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                out.extend_from_slice(key);
+                out.extend_from_slice(v);
+            }
+            None => {
+                out.push(1);
+                out.extend_from_slice(&0u32.to_le_bytes());
+                out.extend_from_slice(key);
+            }
+        }
+    }
+    out
+}
+
+fn decode_table_payload(payload: &[u8]) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>> {
+    if payload.len() < 8 {
+        return Err(Error::Corruption("sstable v3 payload too short"));
+    }
+    let mut offset = 0usize;
+    let count = u64::from_le_bytes(
+        payload[offset..offset + 8]
+            .try_into()
+            .map_err(|_| Error::Corruption("bad sstable v3 count"))?,
+    );
+    offset += 8;
+    let mut out = BTreeMap::new();
+    for _ in 0..count {
+        let (k, v, next) = decode_single_entry(payload, offset)?;
+        offset = next;
+        out.insert(k, v);
+    }
+    if offset != payload.len() {
+        return Err(Error::Corruption("sstable v3 payload trailing garbage"));
+    }
+    Ok(out)
+}
+
+fn read_value_from_payload(payload: &[u8], lookup_key: &[u8]) -> Result<Option<Option<Vec<u8>>>> {
+    if payload.len() < 8 {
+        return Err(Error::Corruption("sstable v3 payload too short"));
+    }
+    let mut offset = 0usize;
+    let count = u64::from_le_bytes(
+        payload[offset..offset + 8]
+            .try_into()
+            .map_err(|_| Error::Corruption("bad sstable v3 count"))?,
+    );
+    offset += 8;
+    for _ in 0..count {
+        let (k, v, next) = decode_single_entry(payload, offset)?;
+        offset = next;
+        match k.as_slice().cmp(lookup_key) {
+            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Equal => return Ok(Some(v)),
+            std::cmp::Ordering::Greater => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+fn decode_single_entry(
+    payload: &[u8],
+    start: usize,
+) -> Result<(Vec<u8>, Option<Vec<u8>>, usize)> {
+    if start + 9 > payload.len() {
+        return Err(Error::Corruption("sstable entry header truncated"));
+    }
+    let key_len = u32::from_le_bytes(
+        payload[start..start + 4]
+            .try_into()
+            .map_err(|_| Error::Corruption("bad key len"))?,
+    ) as usize;
+    let tombstone = payload[start + 4];
+    let value_len = u32::from_le_bytes(
+        payload[start + 5..start + 9]
+            .try_into()
+            .map_err(|_| Error::Corruption("bad value len"))?,
+    ) as usize;
+    let key_start = start + 9;
+    let key_end = key_start + key_len;
+    if key_end > payload.len() {
+        return Err(Error::Corruption("sstable key truncated"));
+    }
+    let key = payload[key_start..key_end].to_vec();
+    match tombstone {
+        1 => Ok((key, None, key_end)),
+        0 => {
+            let value_start = key_end;
+            let value_end = value_start + value_len;
+            if value_end > payload.len() {
+                return Err(Error::Corruption("sstable value truncated"));
+            }
+            let value = payload[value_start..value_end].to_vec();
+            Ok((key, Some(value), value_end))
+        }
+        _ => Err(Error::Corruption("sstable tombstone flag is invalid")),
+    }
+}
+
+fn read_v3_payload(file: &mut File) -> Result<Vec<u8>> {
+    let mut codec = [0u8; 1];
+    let mut uncompressed_len_bytes = [0u8; 8];
+    let mut stored_len_bytes = [0u8; 8];
+    file.read_exact(&mut codec)?;
+    file.read_exact(&mut uncompressed_len_bytes)?;
+    file.read_exact(&mut stored_len_bytes)?;
+    let expected_uncompressed = u64::from_le_bytes(uncompressed_len_bytes) as usize;
+    let stored_len = u64::from_le_bytes(stored_len_bytes) as usize;
+    let mut stored = vec![0u8; stored_len];
+    file.read_exact(&mut stored)?;
+    match codec[0] {
+        CODEC_NONE => {
+            if stored.len() != expected_uncompressed {
+                return Err(Error::Corruption("sstable v3 raw payload size mismatch"));
+            }
+            Ok(stored)
+        }
+        CODEC_ZSTD => {
+            let decoded = zstd::stream::decode_all(stored.as_slice()).map_err(Error::Io)?;
+            if decoded.len() != expected_uncompressed {
+                return Err(Error::Corruption("sstable v3 zstd payload size mismatch"));
+            }
+            Ok(decoded)
+        }
+        _ => Err(Error::Corruption("sstable v3 codec is invalid")),
+    }
 }
 
 fn bloom_hash(key: &[u8], seed: u64) -> u64 {

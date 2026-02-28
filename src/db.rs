@@ -972,8 +972,12 @@ mod tests {
         assert!(dir.join("MANIFEST").exists());
         let manifest = read_manifest(&dir.join("MANIFEST")).expect("manifest");
         assert_eq!(manifest.segments.len(), 1);
-        assert!(dir.join(&manifest.segments[0]).exists());
+        let seg_path = dir.join(&manifest.segments[0]);
+        assert!(seg_path.exists());
         assert!(dir.join(format!("{}.idx", &manifest.segments[0])).exists());
+        let bytes = std::fs::read(seg_path).expect("read segment");
+        assert!(bytes.len() >= 8);
+        assert_eq!(&bytes[0..8], b"TDBSST03");
     }
 
     #[test]
