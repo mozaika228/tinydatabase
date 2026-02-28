@@ -47,6 +47,11 @@ pub struct Database {
     inner: Arc<DbInner>,
 }
 
+pub struct RangeIterator {
+    entries: Vec<(Vec<u8>, Vec<u8>)>,
+    pos: usize,
+}
+
 pub struct Transaction {
     db: Database,
     tx_id: u64,
@@ -119,6 +124,28 @@ impl Database {
         let mut tx = self.begin_tx()?;
         tx.set(key, value);
         tx.commit()
+    }
+
+    pub fn get_range(&self, start_key: &[u8], end_key: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if start_key > end_key {
+            return Err(Error::InvalidData("start_key must be <= end_key".to_string()));
+        }
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| Error::Corruption("state lock poisoned"))?;
+        let snapshot_ts = state.last_commit_ts;
+        let segments = state.segments.clone();
+        let mem_overlay = materialize_visible_mem_overlay(&state.data, snapshot_ts);
+        drop(state);
+        let merged = build_visible_view(&self.inner.dir, &segments, mem_overlay)?;
+        Ok(range_filter(merged, start_key, end_key))
+    }
+
+    pub fn iter_range(&self, start_key: &[u8], end_key: &[u8]) -> Result<RangeIterator> {
+        let entries = self.get_range(start_key, end_key)?;
+        Ok(RangeIterator { entries, pos: 0 })
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<()> {
@@ -249,6 +276,38 @@ impl Transaction {
         }
     }
 
+    pub fn get_range(&self, start_key: &[u8], end_key: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if start_key > end_key {
+            return Err(Error::InvalidData("start_key must be <= end_key".to_string()));
+        }
+        let state = self
+            .db
+            .inner
+            .state
+            .lock()
+            .map_err(|_| Error::Corruption("state lock poisoned"))?;
+        let segments = state.segments.clone();
+        let visible_flushed = self.snapshot_ts >= state.last_flushed_commit_ts;
+        let mut mem_overlay = materialize_visible_mem_overlay(&state.data, self.snapshot_ts);
+        drop(state);
+
+        for (k, v) in &self.writes {
+            mem_overlay.insert(k.clone(), v.clone());
+        }
+
+        let merged = if visible_flushed {
+            build_visible_view(&self.db.inner.dir, &segments, mem_overlay)?
+        } else {
+            mem_overlay
+        };
+        Ok(range_filter(merged, start_key, end_key))
+    }
+
+    pub fn iter_range(&self, start_key: &[u8], end_key: &[u8]) -> Result<RangeIterator> {
+        let entries = self.get_range(start_key, end_key)?;
+        Ok(RangeIterator { entries, pos: 0 })
+    }
+
     pub fn commit(&mut self) -> Result<()> {
         if self.closed {
             return Ok(());
@@ -326,6 +385,19 @@ impl Transaction {
 impl Drop for Transaction {
     fn drop(&mut self) {
         self.closed = true;
+    }
+}
+
+impl Iterator for RangeIterator {
+    type Item = (Vec<u8>, Vec<u8>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.entries.len() {
+            return None;
+        }
+        let out = self.entries[self.pos].clone();
+        self.pos += 1;
+        Some(out)
     }
 }
 
@@ -424,6 +496,58 @@ fn read_from_segments(
         }
     }
     Ok(None)
+}
+
+fn materialize_visible_mem_overlay(
+    data: &BTreeMap<Vec<u8>, Vec<VersionedValue>>,
+    snapshot_ts: u64,
+) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+    let mut out = BTreeMap::new();
+    for (k, versions) in data {
+        if let Some(v) = versions.iter().rev().find(|x| x.commit_ts <= snapshot_ts) {
+            out.insert(k.clone(), v.value.clone());
+        }
+    }
+    out
+}
+
+fn build_visible_view(
+    dir: &Path,
+    segments: &[SegmentEntry],
+    mem_overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>> {
+    let mut out = BTreeMap::new();
+    for segment in segments {
+        let path = dir.join(&segment.name);
+        if !path.exists() {
+            continue;
+        }
+        let table = read_table(&path)?;
+        for (k, v) in table {
+            out.insert(k, v);
+        }
+    }
+    for (k, v) in mem_overlay {
+        out.insert(k, v);
+    }
+    Ok(out)
+}
+
+fn range_filter(
+    merged: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    start_key: &[u8],
+    end_key: &[u8],
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
+    for (k, v) in merged {
+        if k.as_slice() < start_key || k.as_slice() >= end_key {
+            continue;
+        }
+        if let Some(value) = v {
+            out.push((k, value));
+        }
+    }
+    out
 }
 
 fn apply_record_for_recovery(
@@ -720,5 +844,61 @@ mod tests {
         }
         let manifest = read_manifest(&dir.join("MANIFEST")).expect("manifest");
         assert!(manifest.segments.len() <= MAX_SEGMENTS_BEFORE_COMPACT);
+    }
+
+    #[test]
+    fn database_get_range_returns_sorted_slice() {
+        let dir = unique_dir("range-db");
+        let db = Database::open(&dir).expect("open");
+        db.set(b"a", b"1").expect("set a");
+        db.set(b"b", b"2").expect("set b");
+        db.set(b"c", b"3").expect("set c");
+        db.set(b"d", b"4").expect("set d");
+        let range = db.get_range(b"b", b"d").expect("range");
+        assert_eq!(
+            range,
+            vec![
+                (b"b".to_vec(), b"2".to_vec()),
+                (b"c".to_vec(), b"3".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn transaction_range_is_snapshot_consistent() {
+        let dir = unique_dir("range-tx");
+        let db = Database::open(&dir).expect("open");
+        db.set(b"k1", b"v1").expect("set k1");
+        db.set(b"k2", b"v2").expect("set k2");
+        let tx = db.begin_tx().expect("begin tx");
+        db.set(b"k2", b"v2-new").expect("update k2");
+        db.set(b"k3", b"v3").expect("set k3");
+        let tx_range = tx.get_range(b"k1", b"k4").expect("tx range");
+        assert_eq!(
+            tx_range,
+            vec![
+                (b"k1".to_vec(), b"v1".to_vec()),
+                (b"k2".to_vec(), b"v2".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn range_iterator_yields_all_items() {
+        let dir = unique_dir("range-iter");
+        let db = Database::open(&dir).expect("open");
+        db.set(b"a", b"1").expect("set a");
+        db.set(b"b", b"2").expect("set b");
+        db.set(b"c", b"3").expect("set c");
+        let iter = db.iter_range(b"a", b"z").expect("iter");
+        let collected: Vec<_> = iter.collect();
+        assert_eq!(
+            collected,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+                (b"c".to_vec(), b"3".to_vec()),
+            ]
+        );
     }
 }

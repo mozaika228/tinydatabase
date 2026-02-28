@@ -35,6 +35,8 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
 
 - `Database::open(path)`
 - `Database::get(key)`
+- `Database::get_range(start_key, end_key)` (start inclusive, end exclusive)
+- `Database::iter_range(start_key, end_key)`
 - `Database::set(key, value)`
 - `Database::delete(key)`
 - `Database::begin_tx() -> Transaction`
