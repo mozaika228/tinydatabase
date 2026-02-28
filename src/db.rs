@@ -716,6 +716,8 @@ fn read_entry(file: &mut File) -> Result<(Vec<u8>, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
+    use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_dir(name: &str) -> PathBuf {
@@ -724,6 +726,10 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
         std::env::temp_dir().join(format!("tinydatabase-{name}-{stamp}"))
+    }
+
+    fn wal_path(dir: &Path) -> PathBuf {
+        dir.join("db.wal")
     }
 
     #[test]
@@ -900,5 +906,47 @@ mod tests {
                 (b"c".to_vec(), b"3".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn recovery_ignores_truncated_wal_tail() {
+        let dir = unique_dir("wal-tail");
+        {
+            let db = Database::open(&dir).expect("open");
+            db.set(b"a", b"1").expect("set a");
+            db.set(b"b", b"2").expect("set b");
+        }
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(wal_path(&dir))
+                .expect("open wal");
+            file.write_all(&[0x54, 0x44, 0x42]).expect("append tail");
+            file.sync_data().expect("sync");
+        }
+        let db2 = Database::open(&dir).expect("reopen");
+        assert_eq!(db2.get(b"a").expect("get a"), Some(b"1".to_vec()));
+        assert_eq!(db2.get(b"b").expect("get b"), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn recovery_ignores_crc_corrupted_last_record() {
+        let dir = unique_dir("wal-crc");
+        {
+            let db = Database::open(&dir).expect("open");
+            db.set(b"k1", b"v1").expect("set k1");
+            db.set(b"k2", b"v2").expect("set k2");
+        }
+        {
+            let wal = wal_path(&dir);
+            let mut bytes = std::fs::read(&wal).expect("read wal");
+            let n = bytes.len();
+            assert!(n > 0);
+            bytes[n - 1] ^= 0xFF;
+            std::fs::write(&wal, bytes).expect("write wal");
+        }
+        let db2 = Database::open(&dir).expect("reopen");
+        assert_eq!(db2.get(b"k1").expect("get k1"), Some(b"v1".to_vec()));
+        assert_eq!(db2.get(b"k2").expect("get k2"), None);
     }
 }

@@ -26,6 +26,7 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
   - read path: memtable + disk merge (`newest -> oldest` segments)
   - per-segment index sidecar (`min/max key` + bloom filter)
 - Recovery on startup from manifest/segments + WAL replay
+  - tested against truncated and CRC-corrupted WAL tail
 - Replication foundation:
   - replicated log with `index` + `term` + checksums
   - deterministic state hash from applied commands
