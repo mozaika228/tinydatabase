@@ -9,7 +9,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 const MAX_SEGMENTS_BEFORE_COMPACT: usize = 4;
 
@@ -41,6 +44,7 @@ struct DbInner {
     state: Mutex<DbState>,
     wal: Mutex<Wal>,
     commit_lock: Mutex<()>,
+    bg_compaction: Mutex<Option<BackgroundCompaction>>,
 }
 
 #[derive(Clone)]
@@ -59,6 +63,11 @@ pub struct Transaction {
     snapshot_ts: u64,
     writes: HashMap<Vec<u8>, Option<Vec<u8>>>,
     closed: bool,
+}
+
+struct BackgroundCompaction {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
 }
 
 impl Database {
@@ -96,6 +105,7 @@ impl Database {
             state: Mutex::new(state),
             wal: Mutex::new(wal),
             commit_lock: Mutex::new(()),
+            bg_compaction: Mutex::new(None),
         });
         Ok(Self { inner })
     }
@@ -271,6 +281,61 @@ impl Database {
             .map_err(|_| Error::Corruption("wal lock poisoned"))?;
         wal.sync()?;
         wal.reset()?;
+        Ok(())
+    }
+
+    pub fn start_background_compaction(&self, interval: Duration) -> Result<()> {
+        if interval.is_zero() {
+            return Err(Error::InvalidData(
+                "background compaction interval must be > 0".to_string(),
+            ));
+        }
+        let mut guard = self
+            .inner
+            .bg_compaction
+            .lock()
+            .map_err(|_| Error::Corruption("bg compaction lock poisoned"))?;
+        if guard.is_some() {
+            return Err(Error::InvalidData(
+                "background compaction already running".to_string(),
+            ));
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let weak_inner: Weak<DbInner> = Arc::downgrade(&self.inner);
+        let handle = thread::spawn(move || {
+            loop {
+                if stop_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Some(inner) = weak_inner.upgrade() else {
+                    break;
+                };
+                let db = Database { inner };
+                let _ = db.checkpoint();
+                let _ = db.gc_old_versions();
+                thread::sleep(interval);
+            }
+        });
+
+        *guard = Some(BackgroundCompaction { stop, handle });
+        Ok(())
+    }
+
+    pub fn stop_background_compaction(&self) -> Result<()> {
+        let bg = {
+            let mut guard = self
+                .inner
+                .bg_compaction
+                .lock()
+                .map_err(|_| Error::Corruption("bg compaction lock poisoned"))?;
+            guard.take()
+        };
+        if let Some(bg) = bg {
+            bg.stop.store(true, Ordering::Relaxed);
+            let _ = bg.handle.join();
+        }
         Ok(())
     }
 }
@@ -788,6 +853,7 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     fn unique_dir(name: &str) -> PathBuf {
         let stamp = SystemTime::now()
@@ -1047,5 +1113,29 @@ mod tests {
         let db2 = Database::open(&dir).expect("reopen");
         assert_eq!(db2.get(b"k1").expect("get k1"), Some(b"v1".to_vec()));
         assert_eq!(db2.get(b"k2").expect("get k2"), None);
+    }
+
+    #[test]
+    fn background_compaction_start_stop() {
+        let dir = unique_dir("bg-compact");
+        let db = Database::open(&dir).expect("open");
+        db.set(b"a", b"1").expect("set");
+        db.start_background_compaction(Duration::from_millis(10))
+            .expect("start");
+        std::thread::sleep(Duration::from_millis(30));
+        db.stop_background_compaction().expect("stop");
+    }
+
+    #[test]
+    fn background_compaction_double_start_fails() {
+        let dir = unique_dir("bg-compact-2");
+        let db = Database::open(&dir).expect("open");
+        db.start_background_compaction(Duration::from_millis(50))
+            .expect("start");
+        let err = db
+            .start_background_compaction(Duration::from_millis(50))
+            .expect_err("double start should fail");
+        assert!(matches!(err, Error::InvalidData(_)));
+        db.stop_background_compaction().expect("stop");
     }
 }

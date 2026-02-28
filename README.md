@@ -43,6 +43,8 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
 - `Database::begin_tx() -> Transaction`
 - `Database::checkpoint()`
 - `Database::gc_old_versions() -> removed_count`
+- `Database::start_background_compaction(interval)`
+- `Database::stop_background_compaction()`
 - `ReplicatedLog::open/append/append_entry/entries_from/truncate_suffix`
 - `SnapshotInstaller::begin` + `SnapshotInstall::append_chunk/finalize`
 - `deterministic_state_hash(entries)`
