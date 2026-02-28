@@ -29,6 +29,9 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
   - per-segment index sidecar (`min/max key` + bloom filter)
 - Recovery on startup from manifest/segments + WAL replay
   - tested against truncated and CRC-corrupted WAL tail
+- PITR foundation:
+  - WAL archives are stored as `pitr/wal-*.wal` during checkpoint
+  - restore to historical commit point via `restore_to_commit_ts`
 - Replication foundation:
   - replicated log with `index` + `term` + checksums
   - WAL shipping v1 (`append request` with `prev_index/prev_term`)
@@ -49,6 +52,7 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
 - `Database::gc_old_versions() -> removed_count`
 - `Database::start_background_compaction(interval)`
 - `Database::stop_background_compaction()`
+- `Database::restore_to_commit_ts(path, target_commit_ts)`
 - `ReplicatedLog::open/append/append_entry/entries_from/truncate_suffix`
 - `ReplicatedLog::build_append_request/apply_append_request`
 - `SnapshotInstaller::begin` + `SnapshotInstall::append_chunk/finalize`

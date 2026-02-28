@@ -44,6 +44,7 @@ struct SegmentEntry {
 struct DbInner {
     dir: PathBuf,
     manifest_path: PathBuf,
+    wal_path: PathBuf,
     state: Mutex<DbState>,
     wal: Mutex<Wal>,
     commit_lock: Mutex<()>,
@@ -111,6 +112,7 @@ impl Database {
         let inner = Arc::new(DbInner {
             dir,
             manifest_path,
+            wal_path,
             state: Mutex::new(state),
             wal: Mutex::new(wal),
             commit_lock: Mutex::new(()),
@@ -297,7 +299,48 @@ impl Database {
             .lock()
             .map_err(|_| Error::Corruption("wal lock poisoned"))?;
         wal.sync()?;
+        archive_wal_if_nonempty(&self.inner.wal_path, &self.inner.dir, state.last_commit_ts)?;
         wal.reset()?;
+        Ok(())
+    }
+
+    pub fn restore_to_commit_ts(path: impl AsRef<Path>, target_commit_ts: u64) -> Result<()> {
+        let dir = path.as_ref().to_path_buf();
+        fs::create_dir_all(&dir)?;
+
+        let mut state = DbState::default();
+        let mut pending: HashMap<u64, Vec<Record>> = HashMap::new();
+        let mut max_tx_id = 0u64;
+        let wal_files = collect_pitr_wal_files(&dir)?;
+        'outer: for wal_path in wal_files {
+            for record in Wal::read_all(&wal_path)? {
+                if matches!(record, Record::Commit { .. }) && state.last_commit_ts >= target_commit_ts {
+                    break 'outer;
+                }
+                max_tx_id = max_tx_id.max(record_tx_id(&record));
+                apply_record_for_recovery(&mut state, &mut pending, record)?;
+            }
+        }
+        state.next_tx_id = max_tx_id;
+        state.last_flushed_commit_ts = state.last_commit_ts;
+
+        cleanup_live_state(&dir)?;
+        let materialized = materialize_latest_with_tombstones(&state.data);
+        let segments = if materialized.is_empty() {
+            Vec::new()
+        } else {
+            let seg_name = format!("l1-{:020}.sst", state.last_commit_ts);
+            write_segment_atomically(&dir, &seg_name, &materialized)?;
+            vec![seg_name]
+        };
+        let manifest = Manifest {
+            last_commit_ts: state.last_commit_ts,
+            next_tx_id: state.next_tx_id,
+            last_flushed_commit_ts: state.last_flushed_commit_ts,
+            segments,
+        };
+        write_manifest(&dir.join("MANIFEST"), &manifest)?;
+        File::create(dir.join("db.wal"))?;
         Ok(())
     }
 
@@ -787,6 +830,77 @@ fn build_compaction_view(
     Ok(out)
 }
 
+fn materialize_latest_with_tombstones(
+    data: &BTreeMap<Vec<u8>, Vec<VersionedValue>>,
+) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+    let mut out = BTreeMap::new();
+    for (k, versions) in data {
+        if let Some(v) = versions.last() {
+            out.insert(k.clone(), v.value.clone());
+        }
+    }
+    out
+}
+
+fn archive_wal_if_nonempty(wal_path: &Path, db_dir: &Path, commit_ts: u64) -> Result<()> {
+    if !wal_path.exists() {
+        return Ok(());
+    }
+    let data = std::fs::read(wal_path)?;
+    if data.is_empty() {
+        return Ok(());
+    }
+    let pitr_dir = db_dir.join("pitr");
+    fs::create_dir_all(&pitr_dir)?;
+    let archive_name = format!("wal-{:020}.wal", commit_ts);
+    std::fs::write(pitr_dir.join(archive_name), data)?;
+    Ok(())
+}
+
+fn collect_pitr_wal_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let pitr_dir = dir.join("pitr");
+    if pitr_dir.exists() {
+        for entry in fs::read_dir(&pitr_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|x| x.to_str()) == Some("wal") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+
+    let live_wal = dir.join("db.wal");
+    if live_wal.exists() && std::fs::metadata(&live_wal)?.len() > 0 {
+        files.push(live_wal);
+    }
+    Ok(files)
+}
+
+fn cleanup_live_state(dir: &Path) -> Result<()> {
+    let manifest = dir.join("MANIFEST");
+    if manifest.exists() {
+        fs::remove_file(manifest)?;
+    }
+    let wal = dir.join("db.wal");
+    if wal.exists() {
+        fs::remove_file(wal)?;
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) == Some("sst") {
+            let _ = fs::remove_file(&path);
+            let idx = PathBuf::from(format!("{}.idx", path.to_string_lossy()));
+            if idx.exists() {
+                let _ = fs::remove_file(idx);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn load_segment_entry(dir: &Path, name: &str) -> Result<SegmentEntry> {
     let idx_path = dir.join(format!("{name}.idx"));
     let meta = if idx_path.exists() {
@@ -1180,6 +1294,27 @@ mod tests {
             .expect_err("double start should fail");
         assert!(matches!(err, Error::InvalidData(_)));
         db.stop_background_compaction().expect("stop");
+    }
+
+    #[test]
+    fn pitr_restore_to_commit_ts() {
+        let dir = unique_dir("pitr");
+        let db = Database::open(&dir).expect("open");
+
+        db.set(b"a", b"1").expect("set a1");
+        db.set(b"b", b"1").expect("set b1");
+        db.checkpoint().expect("cp1");
+
+        db.set(b"a", b"2").expect("set a2");
+        db.delete(b"b").expect("del b");
+        db.set(b"c", b"1").expect("set c1");
+        db.checkpoint().expect("cp2");
+
+        Database::restore_to_commit_ts(&dir, 2).expect("restore");
+        let restored = Database::open(&dir).expect("reopen");
+        assert_eq!(restored.get(b"a").expect("get a"), Some(b"1".to_vec()));
+        assert_eq!(restored.get(b"b").expect("get b"), Some(b"1".to_vec()));
+        assert_eq!(restored.get(b"c").expect("get c"), None);
     }
 
     #[test]
