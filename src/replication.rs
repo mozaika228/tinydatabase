@@ -20,6 +20,19 @@ pub struct LogEntry {
     pub command: Command,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendRequest {
+    pub prev_index: u64,
+    pub prev_term: u64,
+    pub entries: Vec<LogEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendResponse {
+    pub success: bool,
+    pub last_index: u64,
+}
+
 pub struct ReplicatedLog {
     path: PathBuf,
     file: File,
@@ -109,6 +122,58 @@ impl ReplicatedLog {
             self.last_term = 0;
         }
         Ok(())
+    }
+
+    pub fn build_append_request(&self, from_index: u64, max_entries: usize) -> Result<AppendRequest> {
+        let prev_index = from_index.saturating_sub(1);
+        let prev_term = self.term_at(prev_index)?.unwrap_or(0);
+        let mut entries = self.entries_from(from_index)?;
+        if entries.len() > max_entries {
+            entries.truncate(max_entries);
+        }
+        Ok(AppendRequest {
+            prev_index,
+            prev_term,
+            entries,
+        })
+    }
+
+    pub fn apply_append_request(&mut self, req: &AppendRequest) -> Result<AppendResponse> {
+        if req.prev_index > 0 {
+            let local_prev_term = self.term_at(req.prev_index)?;
+            if local_prev_term != Some(req.prev_term) {
+                return Ok(AppendResponse {
+                    success: false,
+                    last_index: self.last_index,
+                });
+            }
+        }
+
+        for entry in &req.entries {
+            if let Some(local_term) = self.term_at(entry.index)? {
+                if local_term == entry.term {
+                    continue;
+                }
+                self.truncate_suffix(entry.index.saturating_sub(1))?;
+            }
+            if entry.index > self.last_index {
+                self.append_entry(entry)?;
+            }
+        }
+
+        Ok(AppendResponse {
+            success: true,
+            last_index: self.last_index,
+        })
+    }
+
+    fn term_at(&self, index: u64) -> Result<Option<u64>> {
+        if index == 0 {
+            return Ok(Some(0));
+        }
+        let mut file = OpenOptions::new().read(true).open(&self.path)?;
+        let entries = read_all_entries(&mut file)?;
+        Ok(entries.into_iter().find(|e| e.index == index).map(|e| e.term))
     }
 }
 
@@ -430,5 +495,96 @@ mod tests {
         install.finalize().expect("finalize");
         let got = std::fs::read(path).expect("read");
         assert_eq!(got, bytes);
+    }
+
+    #[test]
+    fn wal_shipping_apply_success() {
+        let leader_path = unique_file("leader");
+        let follower_path = unique_file("follower");
+        let mut leader = ReplicatedLog::open(&leader_path).expect("leader open");
+        let mut follower = ReplicatedLog::open(&follower_path).expect("follower open");
+
+        leader
+            .append(
+                1,
+                Command::Set {
+                    key: b"a".to_vec(),
+                    value: b"1".to_vec(),
+                },
+            )
+            .expect("append 1");
+        leader
+            .append(
+                1,
+                Command::Set {
+                    key: b"b".to_vec(),
+                    value: b"2".to_vec(),
+                },
+            )
+            .expect("append 2");
+
+        let req = leader.build_append_request(1, 1024).expect("build req");
+        let res = follower.apply_append_request(&req).expect("apply");
+        assert!(res.success);
+        assert_eq!(res.last_index, 2);
+
+        let l_hash = deterministic_state_hash(&leader.entries_from(1).expect("l entries"));
+        let f_hash = deterministic_state_hash(&follower.entries_from(1).expect("f entries"));
+        assert_eq!(l_hash, f_hash);
+    }
+
+    #[test]
+    fn wal_shipping_conflict_truncates_and_overwrites() {
+        let leader_path = unique_file("leader-conflict");
+        let follower_path = unique_file("follower-conflict");
+        let mut leader = ReplicatedLog::open(&leader_path).expect("leader open");
+        let mut follower = ReplicatedLog::open(&follower_path).expect("follower open");
+
+        leader
+            .append(
+                1,
+                Command::Set {
+                    key: b"x".to_vec(),
+                    value: b"v1".to_vec(),
+                },
+            )
+            .expect("leader e1");
+        leader
+            .append(
+                2,
+                Command::Set {
+                    key: b"x".to_vec(),
+                    value: b"v2".to_vec(),
+                },
+            )
+            .expect("leader e2");
+
+        follower
+            .append(
+                1,
+                Command::Set {
+                    key: b"x".to_vec(),
+                    value: b"old".to_vec(),
+                },
+            )
+            .expect("follower e1");
+        follower
+            .append(
+                3,
+                Command::Set {
+                    key: b"x".to_vec(),
+                    value: b"divergent".to_vec(),
+                },
+            )
+            .expect("follower e2");
+
+        let req = leader.build_append_request(2, 1024).expect("build req");
+        let res = follower.apply_append_request(&req).expect("apply");
+        assert!(res.success);
+        assert_eq!(res.last_index, 2);
+
+        let l_hash = deterministic_state_hash(&leader.entries_from(1).expect("l entries"));
+        let f_hash = deterministic_state_hash(&follower.entries_from(1).expect("f entries"));
+        assert_eq!(l_hash, f_hash);
     }
 }

@@ -31,6 +31,7 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
   - tested against truncated and CRC-corrupted WAL tail
 - Replication foundation:
   - replicated log with `index` + `term` + checksums
+  - WAL shipping v1 (`append request` with `prev_index/prev_term`)
   - deterministic state hash from applied commands
   - chunked snapshot install protocol with integrity check
 
@@ -49,6 +50,7 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
 - `Database::start_background_compaction(interval)`
 - `Database::stop_background_compaction()`
 - `ReplicatedLog::open/append/append_entry/entries_from/truncate_suffix`
+- `ReplicatedLog::build_append_request/apply_append_request`
 - `SnapshotInstaller::begin` + `SnapshotInstall::append_chunk/finalize`
 - `deterministic_state_hash(entries)`
 - `BatchOp::{Put, Delete}`
