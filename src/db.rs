@@ -26,6 +26,7 @@ struct DbState {
     last_commit_ts: u64,
     last_flushed_commit_ts: u64,
     segments: Vec<SegmentEntry>, // oldest -> newest
+    active_snapshots: BTreeMap<u64, usize>,
 }
 
 #[derive(Clone)]
@@ -171,6 +172,16 @@ impl Database {
             .lock()
             .map_err(|_| Error::Corruption("wal lock poisoned"))?;
         wal.append(&Record::Begin { tx_id })?;
+        drop(wal);
+
+        {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| Error::Corruption("state lock poisoned"))?;
+            register_snapshot(&mut state, snapshot_ts);
+        }
 
         Ok(Transaction {
             db: self.clone(),
@@ -179,6 +190,29 @@ impl Database {
             writes: HashMap::new(),
             closed: false,
         })
+    }
+
+    pub fn gc_old_versions(&self) -> Result<usize> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| Error::Corruption("state lock poisoned"))?;
+        let floor = oldest_active_snapshot(&state).unwrap_or(state.last_commit_ts);
+        let mut removed = 0usize;
+        for versions in state.data.values_mut() {
+            if versions.len() <= 1 {
+                continue;
+            }
+            let Some(keep_from) = versions.iter().rposition(|v| v.commit_ts <= floor) else {
+                continue;
+            };
+            if keep_from > 0 {
+                removed += keep_from;
+                versions.drain(0..keep_from);
+            }
+        }
+        Ok(removed)
     }
 
     pub fn checkpoint(&self) -> Result<()> {
@@ -376,15 +410,16 @@ impl Transaction {
             append_version(&mut state.data, key.clone(), commit_ts, value.clone());
         }
         state.last_commit_ts = commit_ts;
+        drop(state);
 
-        self.closed = true;
+        self.close();
         Ok(())
     }
 }
 
 impl Drop for Transaction {
     fn drop(&mut self) {
-        self.closed = true;
+        self.close();
     }
 }
 
@@ -398,6 +433,18 @@ impl Iterator for RangeIterator {
         let out = self.entries[self.pos].clone();
         self.pos += 1;
         Some(out)
+    }
+}
+
+impl Transaction {
+    fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        if let Ok(mut state) = self.db.inner.state.lock() {
+            unregister_snapshot(&mut state, self.snapshot_ts);
+        }
+        self.closed = true;
     }
 }
 
@@ -441,6 +488,7 @@ fn load_state_from_manifest(dir: &Path, manifest_path: &Path) -> Result<DbState>
         last_commit_ts: manifest.last_commit_ts,
         last_flushed_commit_ts: manifest.last_flushed_commit_ts,
         segments,
+        active_snapshots: BTreeMap::new(),
     })
 }
 
@@ -459,6 +507,25 @@ fn append_version(
     value: Option<Vec<u8>>,
 ) {
     data.entry(key).or_default().push(VersionedValue { commit_ts, value });
+}
+
+fn register_snapshot(state: &mut DbState, snapshot_ts: u64) {
+    let counter = state.active_snapshots.entry(snapshot_ts).or_insert(0);
+    *counter += 1;
+}
+
+fn unregister_snapshot(state: &mut DbState, snapshot_ts: u64) {
+    if let Some(counter) = state.active_snapshots.get_mut(&snapshot_ts) {
+        if *counter > 1 {
+            *counter -= 1;
+        } else {
+            state.active_snapshots.remove(&snapshot_ts);
+        }
+    }
+}
+
+fn oldest_active_snapshot(state: &DbState) -> Option<u64> {
+    state.active_snapshots.keys().next().copied()
 }
 
 enum MemRead {
@@ -677,6 +744,7 @@ fn read_legacy_snapshot_v2(mut file: File) -> Result<DbState> {
         last_commit_ts,
         last_flushed_commit_ts: last_commit_ts,
         segments: Vec::new(),
+        active_snapshots: BTreeMap::new(),
     })
 }
 
@@ -696,6 +764,7 @@ fn read_legacy_snapshot_v1(mut file: File) -> Result<DbState> {
         last_commit_ts: ts,
         last_flushed_commit_ts: ts,
         segments: Vec::new(),
+        active_snapshots: BTreeMap::new(),
     })
 }
 
@@ -906,6 +975,36 @@ mod tests {
                 (b"c".to_vec(), b"3".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn gc_removes_stale_versions_without_active_snapshots() {
+        let dir = unique_dir("gc-basic");
+        let db = Database::open(&dir).expect("open");
+        db.set(b"k", b"v1").expect("set 1");
+        db.set(b"k", b"v2").expect("set 2");
+        db.set(b"k", b"v3").expect("set 3");
+        let removed = db.gc_old_versions().expect("gc");
+        assert_eq!(removed, 2);
+        assert_eq!(db.get(b"k").expect("get"), Some(b"v3".to_vec()));
+    }
+
+    #[test]
+    fn gc_respects_oldest_active_snapshot() {
+        let dir = unique_dir("gc-snapshot");
+        let db = Database::open(&dir).expect("open");
+        db.set(b"k", b"v1").expect("set 1");
+        let tx = db.begin_tx().expect("begin");
+        db.set(b"k", b"v2").expect("set 2");
+
+        let removed_while_active = db.gc_old_versions().expect("gc active");
+        assert_eq!(removed_while_active, 0);
+        assert_eq!(tx.get(b"k").expect("tx get"), Some(b"v1".to_vec()));
+
+        drop(tx);
+        let removed_after_drop = db.gc_old_versions().expect("gc after");
+        assert_eq!(removed_after_drop, 1);
+        assert_eq!(db.get(b"k").expect("get"), Some(b"v2".to_vec()));
     }
 
     #[test]
