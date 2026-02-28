@@ -35,6 +35,7 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
 - Replication foundation:
   - replicated log with `index` + `term` + checksums
   - WAL shipping v1 (`append request` with `prev_index/prev_term`)
+  - Raft protocol skeleton (election, voting, heartbeat role transitions)
   - deterministic state hash from applied commands
   - chunked snapshot install protocol with integrity check
 
@@ -55,6 +56,7 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
 - `Database::restore_to_commit_ts(path, target_commit_ts)`
 - `ReplicatedLog::open/append/append_entry/entries_from/truncate_suffix`
 - `ReplicatedLog::build_append_request/apply_append_request`
+- `RaftNode` + `RaftVoteRequest/Response` + `RaftAppendEntriesRequest/Response`
 - `SnapshotInstaller::begin` + `SnapshotInstall::append_chunk/finalize`
 - `deterministic_state_hash(entries)`
 - `BatchOp::{Put, Delete}`
