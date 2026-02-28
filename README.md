@@ -40,6 +40,7 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
 - `Database::iter_range(start_key, end_key)`
 - `Database::set(key, value)`
 - `Database::delete(key)`
+- `Database::write_batch(ops: &[BatchOp])`
 - `Database::begin_tx() -> Transaction`
 - `Database::checkpoint()`
 - `Database::gc_old_versions() -> removed_count`
@@ -48,6 +49,7 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
 - `ReplicatedLog::open/append/append_entry/entries_from/truncate_suffix`
 - `SnapshotInstaller::begin` + `SnapshotInstall::append_chunk/finalize`
 - `deterministic_state_hash(entries)`
+- `BatchOp::{Put, Delete}`
 
 ## C ABI
 

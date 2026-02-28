@@ -57,6 +57,12 @@ pub struct RangeIterator {
     pos: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchOp {
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
+}
+
 pub struct Transaction {
     db: Database,
     tx_id: u64,
@@ -162,6 +168,12 @@ impl Database {
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         let mut tx = self.begin_tx()?;
         tx.delete(key);
+        tx.commit()
+    }
+
+    pub fn write_batch(&self, ops: &[BatchOp]) -> Result<()> {
+        let mut tx = self.begin_tx()?;
+        tx.apply_batch(ops);
         tx.commit()
     }
 
@@ -347,6 +359,15 @@ impl Transaction {
 
     pub fn delete(&mut self, key: &[u8]) {
         self.writes.insert(key.to_vec(), None);
+    }
+
+    pub fn apply_batch(&mut self, ops: &[BatchOp]) {
+        for op in ops {
+            match op {
+                BatchOp::Put(k, v) => self.set(k, v),
+                BatchOp::Delete(k) => self.delete(k),
+            }
+        }
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -1137,5 +1158,35 @@ mod tests {
             .expect_err("double start should fail");
         assert!(matches!(err, Error::InvalidData(_)));
         db.stop_background_compaction().expect("stop");
+    }
+
+    #[test]
+    fn write_batch_applies_puts_and_deletes_atomically() {
+        let dir = unique_dir("batch-basic");
+        let db = Database::open(&dir).expect("open");
+        db.set(b"a", b"old").expect("seed");
+        let ops = vec![
+            BatchOp::Put(b"a".to_vec(), b"new".to_vec()),
+            BatchOp::Put(b"b".to_vec(), b"2".to_vec()),
+            BatchOp::Delete(b"c".to_vec()),
+        ];
+        db.write_batch(&ops).expect("batch");
+        assert_eq!(db.get(b"a").expect("get a"), Some(b"new".to_vec()));
+        assert_eq!(db.get(b"b").expect("get b"), Some(b"2".to_vec()));
+        assert_eq!(db.get(b"c").expect("get c"), None);
+    }
+
+    #[test]
+    fn write_batch_last_operation_wins_per_key() {
+        let dir = unique_dir("batch-last-wins");
+        let db = Database::open(&dir).expect("open");
+        let ops = vec![
+            BatchOp::Put(b"k".to_vec(), b"1".to_vec()),
+            BatchOp::Put(b"k".to_vec(), b"2".to_vec()),
+            BatchOp::Delete(b"k".to_vec()),
+            BatchOp::Put(b"k".to_vec(), b"3".to_vec()),
+        ];
+        db.write_batch(&ops).expect("batch");
+        assert_eq!(db.get(b"k").expect("get"), Some(b"3".to_vec()));
     }
 }
