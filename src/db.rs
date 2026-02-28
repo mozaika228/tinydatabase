@@ -15,8 +15,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 const L0_COMPACTION_TRIGGER: usize = 4;
+const LEVEL_SIZE_RATIO: usize = 4;
+const MAX_LEVEL: u8 = 4;
 const LEVEL_L0: u8 = 0;
-const LEVEL_L1: u8 = 1;
 
 #[derive(Clone)]
 struct VersionedValue {
@@ -263,24 +264,7 @@ impl Database {
             state.last_flushed_commit_ts = state.last_commit_ts;
         }
 
-        let l0_count = state.segments.iter().filter(|s| s.level == LEVEL_L0).count();
-        if l0_count > L0_COMPACTION_TRIGGER {
-            let l1_name = format!("l1-{:020}.sst", state.last_commit_ts);
-            let compact_data = build_compaction_view(&self.inner.dir, &state.segments, &state.data)?;
-            write_segment_atomically(&self.inner.dir, &l1_name, &compact_data)?;
-
-            for old in &state.segments {
-                let old_path = self.inner.dir.join(&old.name);
-                let old_idx = self.inner.dir.join(format!("{}.idx", &old.name));
-                if old_path.exists() {
-                    let _ = fs::remove_file(old_path);
-                }
-                if old_idx.exists() {
-                    let _ = fs::remove_file(old_idx);
-                }
-            }
-            state.segments = vec![load_segment_entry(&self.inner.dir, &l1_name)?];
-        }
+        run_level_compaction_plan(&self.inner.dir, &mut state, state.last_commit_ts)?;
 
         let manifest_tmp = self.inner.dir.join("MANIFEST.tmp");
         let manifest = Manifest {
@@ -830,6 +814,135 @@ fn build_compaction_view(
     Ok(out)
 }
 
+fn run_level_compaction_plan(dir: &Path, state: &mut DbState, commit_ts: u64) -> Result<()> {
+    loop {
+        let mut changed = false;
+        for level in 0..MAX_LEVEL {
+            if level_segment_count(&state.segments, level) > level_threshold(level) {
+                compact_level_pair(dir, state, level, commit_ts)?;
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn compact_level_pair(dir: &Path, state: &mut DbState, level: u8, commit_ts: u64) -> Result<()> {
+    let next_level = level.saturating_add(1);
+    let mut src: Vec<SegmentEntry> = state
+        .segments
+        .iter()
+        .filter(|s| s.level == level)
+        .cloned()
+        .collect();
+    src.sort_by(|a, b| a.name.cmp(&b.name));
+    if src.is_empty() {
+        return Ok(());
+    }
+
+    let (min_key, max_key) = segment_span(&src);
+    let mut input = src;
+    let mut dst_overlap: Vec<SegmentEntry> = state
+        .segments
+        .iter()
+        .filter(|s| s.level == next_level && overlaps_segment(s, min_key.as_deref(), max_key.as_deref()))
+        .cloned()
+        .collect();
+    dst_overlap.sort_by(|a, b| a.name.cmp(&b.name));
+    input.extend(dst_overlap);
+
+    let merged = merge_segments_for_compaction(dir, &input)?;
+    let out_name = format!("l{}-{:020}.sst", next_level, commit_ts);
+    write_segment_atomically(dir, &out_name, &merged)?;
+    let out_entry = load_segment_entry(dir, &out_name)?;
+
+    let to_remove: std::collections::HashSet<String> = input.iter().map(|s| s.name.clone()).collect();
+    for old in &input {
+        let old_path = dir.join(&old.name);
+        let old_idx = dir.join(format!("{}.idx", &old.name));
+        if old_path.exists() {
+            let _ = fs::remove_file(old_path);
+        }
+        if old_idx.exists() {
+            let _ = fs::remove_file(old_idx);
+        }
+    }
+
+    state.segments.retain(|s| !to_remove.contains(&s.name));
+    state.segments.push(out_entry);
+    Ok(())
+}
+
+fn merge_segments_for_compaction(
+    dir: &Path,
+    input: &[SegmentEntry],
+) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>> {
+    let mut ordered = input.to_vec();
+    ordered.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut out = BTreeMap::new();
+    for seg in ordered {
+        let path = dir.join(seg.name);
+        if !path.exists() {
+            continue;
+        }
+        let table = read_table(&path)?;
+        for (k, v) in table {
+            out.insert(k, v);
+        }
+    }
+    Ok(out)
+}
+
+fn segment_span(segments: &[SegmentEntry]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let mut min_key: Option<Vec<u8>> = None;
+    let mut max_key: Option<Vec<u8>> = None;
+    for s in segments {
+        if let Some(mn) = &s.meta.min_key {
+            if min_key.as_ref().map(|x| mn < x).unwrap_or(true) {
+                min_key = Some(mn.clone());
+            }
+        }
+        if let Some(mx) = &s.meta.max_key {
+            if max_key.as_ref().map(|x| mx > x).unwrap_or(true) {
+                max_key = Some(mx.clone());
+            }
+        }
+    }
+    (min_key, max_key)
+}
+
+fn overlaps_segment(seg: &SegmentEntry, min: Option<&[u8]>, max: Option<&[u8]>) -> bool {
+    let Some(seg_min) = seg.meta.min_key.as_deref() else {
+        return false;
+    };
+    let Some(seg_max) = seg.meta.max_key.as_deref() else {
+        return false;
+    };
+    let Some(q_min) = min else {
+        return true;
+    };
+    let Some(q_max) = max else {
+        return true;
+    };
+    !(seg_max < q_min || seg_min > q_max)
+}
+
+fn level_segment_count(segments: &[SegmentEntry], level: u8) -> usize {
+    segments.iter().filter(|s| s.level == level).count()
+}
+
+fn level_threshold(level: u8) -> usize {
+    if level == LEVEL_L0 {
+        return L0_COMPACTION_TRIGGER;
+    }
+    let exp = usize::from(level.saturating_sub(1));
+    LEVEL_SIZE_RATIO.saturating_pow(exp as u32)
+}
+
 fn materialize_latest_with_tombstones(
     data: &BTreeMap<Vec<u8>, Vec<VersionedValue>>,
 ) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
@@ -918,13 +1031,14 @@ fn load_segment_entry(dir: &Path, name: &str) -> Result<SegmentEntry> {
 }
 
 fn segment_level_from_name(name: &str) -> u8 {
-    if name.starts_with("l0-") {
-        LEVEL_L0
-    } else if name.starts_with("l1-") {
-        LEVEL_L1
-    } else {
-        LEVEL_L0
+    if let Some(rest) = name.strip_prefix('l') {
+        if let Some((n, _suffix)) = rest.split_once('-') {
+            if let Ok(parsed) = n.parse::<u8>() {
+                return parsed;
+            }
+        }
     }
+    LEVEL_L0
 }
 
 fn read_legacy_snapshot(path: &Path) -> Result<DbState> {
@@ -1140,8 +1254,37 @@ mod tests {
             db.checkpoint().expect("checkpoint");
         }
         let manifest = read_manifest(&dir.join("MANIFEST")).expect("manifest");
-        assert_eq!(manifest.segments.len(), 1);
-        assert!(manifest.segments[0].starts_with("l1-"));
+        let l0 = manifest
+            .segments
+            .iter()
+            .filter(|s| s.starts_with("l0-"))
+            .count();
+        let l1 = manifest
+            .segments
+            .iter()
+            .filter(|s| s.starts_with("l1-"))
+            .count();
+        assert!(l0 <= L0_COMPACTION_TRIGGER);
+        assert!(l1 >= 1);
+    }
+
+    #[test]
+    fn leveled_compaction_promotes_to_l2() {
+        let dir = unique_dir("compact-l2");
+        let db = Database::open(&dir).expect("open");
+        for i in 0..40 {
+            let k = format!("k{i:03}");
+            let v = format!("v{i:03}");
+            db.set(k.as_bytes(), v.as_bytes()).expect("set");
+            db.checkpoint().expect("checkpoint");
+        }
+        let manifest = read_manifest(&dir.join("MANIFEST")).expect("manifest");
+        let l2 = manifest
+            .segments
+            .iter()
+            .filter(|s| s.starts_with("l2-"))
+            .count();
+        assert!(l2 >= 1);
     }
 
     #[test]

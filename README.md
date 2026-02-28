@@ -20,7 +20,7 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
 - In-memory versioned index (BTreeMap + versions)
 - LSM storage engine:
   - multiple immutable SSTable segments
-  - leveled flow: `L0` flush + `L0 -> L1` compaction trigger
+  - leveled planner: `L0/L1/L2+` compaction with overlap rules
   - delta flush on checkpoint (only changes since last flush)
   - tombstones are persisted in SSTable
   - optional zstd compression for SSTable payload
@@ -117,11 +117,11 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
 
 ## Next milestones
 
-1. Multi-level LSM planner (`L0/L1/L2+`) with size ratio and overlap rules
-2. Raft protocol layer (leader election, match index, commit index)
-3. Snapshot install over network (streaming + resume)
-4. Serializable isolation (SSI) on top of replicated commits
-5. Crash/fault matrix (disk + network partitions + node restarts)
+1. Raft protocol layer (leader election, match index, commit index)
+2. Snapshot install over network (streaming + resume)
+3. Serializable isolation (SSI) on top of replicated commits
+4. Crash/fault matrix (disk + network partitions + node restarts)
+5. CI/CD matrix in GitHub Actions (tests, benches, fault jobs)
 
 ## Benchmarks
 
