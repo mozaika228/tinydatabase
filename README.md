@@ -116,5 +116,29 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
 4. Background compaction + tombstone GC policy by age/level
 5. Crash/fault matrix (disk + network partitions + node restarts)
 
+## Benchmarks
+
+- Criterion bench target: `benches/kv_bench.rs`
+- Run:
+  - `cargo bench --bench kv_bench`
+- Current scenarios:
+  - `tinydb_put_10k`
+  - `tinydb_get_10k`
+  - `tinydb_write_batch_10k`
+  - `raw_append_file_put_10k` (simple file baseline)
+  - `in_memory_btreemap_put_10k` (upper-bound baseline)
+
+### Comparison Table Template
+
+| Engine / Scenario | Throughput (ops/sec) | p99 latency | Disk size |
+|---|---:|---:|---:|
+| TinyDB put 10k | TBD | TBD | TBD |
+| TinyDB get 10k | TBD | TBD | TBD |
+| TinyDB write_batch 10k | TBD | TBD | TBD |
+| raw append file put 10k | TBD | TBD | TBD |
+| sled (optional) | TBD | TBD | TBD |
+| rocksdb-rs (optional) | TBD | TBD | TBD |
+| redb (optional) | TBD | TBD | TBD |
+
 
 

@@ -9,3 +9,10 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 crc32fast = "1.4"
 zstd = "0.13"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "kv_bench"
+harness = false
