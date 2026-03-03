@@ -268,7 +268,8 @@ impl Database {
             state.last_flushed_commit_ts = state.last_commit_ts;
         }
 
-        run_level_compaction_plan(&self.inner.dir, &mut state, state.last_commit_ts)?;
+        let compaction_commit_ts = state.last_commit_ts;
+        run_level_compaction_plan(&self.inner.dir, &mut state, compaction_commit_ts)?;
 
         let manifest_tmp = self.inner.dir.join("MANIFEST.tmp");
         let manifest = Manifest {
