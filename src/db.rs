@@ -5,7 +5,7 @@ use crate::sstable::{
     write_index, write_manifest, write_table, Manifest, SegmentMeta,
 };
 use crate::wal::Wal;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -73,6 +73,8 @@ pub struct Transaction {
     tx_id: u64,
     snapshot_ts: u64,
     writes: HashMap<Vec<u8>, Option<Vec<u8>>>,
+    read_set: Mutex<HashSet<Vec<u8>>>,
+    read_ranges: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
     closed: bool,
 }
 
@@ -131,6 +133,7 @@ impl Database {
         let snapshot_ts = state.last_commit_ts;
         let mem_read = read_visible_in_mem(&state, key, snapshot_ts);
         let segments = state.segments.clone();
+        let checkpoint_commit_ts = state.last_commit_ts;
         drop(state);
         match mem_read {
             MemRead::Found(v) => Ok(v),
@@ -216,6 +219,8 @@ impl Database {
             tx_id,
             snapshot_ts,
             writes: HashMap::new(),
+            read_set: Mutex::new(HashSet::new()),
+            read_ranges: Mutex::new(Vec::new()),
             closed: false,
         })
     }
@@ -283,7 +288,7 @@ impl Database {
             .lock()
             .map_err(|_| Error::Corruption("wal lock poisoned"))?;
         wal.sync()?;
-        archive_wal_if_nonempty(&self.inner.wal_path, &self.inner.dir, state.last_commit_ts)?;
+        archive_wal_if_nonempty(&self.inner.wal_path, &self.inner.dir, checkpoint_commit_ts)?;
         wal.reset()?;
         Ok(())
     }
@@ -403,6 +408,7 @@ impl Transaction {
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.record_read_key(key)?;
         if let Some(v) = self.writes.get(key) {
             return Ok(v.clone());
         }
@@ -432,6 +438,7 @@ impl Transaction {
         if start_key > end_key {
             return Err(Error::InvalidData("start_key must be <= end_key".to_string()));
         }
+        self.record_read_range(start_key, end_key)?;
         let state = self
             .db
             .inner
@@ -452,7 +459,11 @@ impl Transaction {
         } else {
             mem_overlay
         };
-        Ok(range_filter(merged, start_key, end_key))
+        let out = range_filter(merged, start_key, end_key);
+        for (k, _) in &out {
+            self.record_read_key(k)?;
+        }
+        Ok(out)
     }
 
     pub fn iter_range(&self, start_key: &[u8], end_key: &[u8]) -> Result<RangeIterator> {
@@ -491,6 +502,7 @@ impl Transaction {
                     )));
                 }
             }
+            self.validate_serializable_reads(&state)?;
             state.last_commit_ts + 1
         };
 
@@ -555,6 +567,66 @@ impl Iterator for RangeIterator {
 }
 
 impl Transaction {
+    fn record_read_key(&self, key: &[u8]) -> Result<()> {
+        let mut reads = self
+            .read_set
+            .lock()
+            .map_err(|_| Error::Corruption("read_set lock poisoned"))?;
+        reads.insert(key.to_vec());
+        Ok(())
+    }
+
+    fn record_read_range(&self, start: &[u8], end: &[u8]) -> Result<()> {
+        let mut ranges = self
+            .read_ranges
+            .lock()
+            .map_err(|_| Error::Corruption("read_ranges lock poisoned"))?;
+        ranges.push((start.to_vec(), end.to_vec()));
+        Ok(())
+    }
+
+    fn validate_serializable_reads(&self, state: &DbState) -> Result<()> {
+        let reads = self
+            .read_set
+            .lock()
+            .map_err(|_| Error::Corruption("read_set lock poisoned"))?;
+        for key in reads.iter() {
+            if self.writes.contains_key(key) {
+                continue;
+            }
+            let latest = latest_commit_ts_for_key(state, key);
+            if latest > self.snapshot_ts {
+                return Err(Error::Conflict(format!(
+                    "serializable read-write conflict for key {:?}",
+                    String::from_utf8_lossy(key)
+                )));
+            }
+        }
+        drop(reads);
+
+        let ranges = self
+            .read_ranges
+            .lock()
+            .map_err(|_| Error::Corruption("read_ranges lock poisoned"))?;
+        for (start, end) in ranges.iter() {
+            for (k, versions) in state.data.range(start.clone()..end.clone()) {
+                if self.writes.contains_key(k) {
+                    continue;
+                }
+                if let Some(v) = versions.last() {
+                    if v.commit_ts > self.snapshot_ts {
+                        return Err(Error::Conflict(format!(
+                            "serializable phantom conflict in range [{:?}, {:?})",
+                            String::from_utf8_lossy(start),
+                            String::from_utf8_lossy(end)
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn close(&mut self) {
         if self.closed {
             return;
@@ -1488,5 +1560,40 @@ mod tests {
         ];
         db.write_batch(&ops).expect("batch");
         assert_eq!(db.get(b"k").expect("get"), Some(b"3".to_vec()));
+    }
+
+    #[test]
+    fn serializable_read_write_conflict_aborts() {
+        let dir = unique_dir("ssi-rw");
+        let db = Database::open(&dir).expect("open");
+        db.set(b"k", b"v1").expect("seed");
+
+        let mut t1 = db.begin_tx().expect("t1");
+        let mut t2 = db.begin_tx().expect("t2");
+        assert_eq!(t1.get(b"k").expect("t1 read"), Some(b"v1".to_vec()));
+        t2.set(b"k", b"v2");
+        t2.commit().expect("t2 commit");
+
+        t1.set(b"x", b"1");
+        let err = t1.commit().expect_err("ssi must abort");
+        assert!(matches!(err, Error::Conflict(_)));
+    }
+
+    #[test]
+    fn serializable_phantom_conflict_aborts() {
+        let dir = unique_dir("ssi-phantom");
+        let db = Database::open(&dir).expect("open");
+        db.set(b"a1", b"1").expect("seed");
+
+        let mut t1 = db.begin_tx().expect("t1");
+        let _ = t1.get_range(b"a", b"b").expect("t1 range");
+
+        let mut t2 = db.begin_tx().expect("t2");
+        t2.set(b"a2", b"2");
+        t2.commit().expect("t2 commit");
+
+        t1.set(b"z", b"1");
+        let err = t1.commit().expect_err("phantom must abort");
+        assert!(matches!(err, Error::Conflict(_)));
     }
 }

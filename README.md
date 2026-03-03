@@ -35,9 +35,16 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
 - Replication foundation:
   - replicated log with `index` + `term` + checksums
   - WAL shipping v1 (`append request` with `prev_index/prev_term`)
-  - Raft protocol skeleton (election, voting, heartbeat role transitions)
+  - Raft protocol layer:
+    - leader election + voting
+    - leader `next_index`/`match_index` tracking
+    - majority-based `commit_index` advancement
   - deterministic state hash from applied commands
   - chunked snapshot install protocol with integrity check
+  - snapshot install over network (session-based streaming + resume by offset ACK)
+- Serializable isolation:
+  - SSI-style validation on commit (read-write + phantom conflict detection)
+  - layered on replicated commit order (`commit_ts`)
 
 ## API
 
@@ -59,6 +66,7 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
 - `RaftNode` + `RaftVoteRequest/Response` + `RaftAppendEntriesRequest/Response`
 - `SnapshotInstaller::begin` + `SnapshotInstall::append_chunk/finalize`
 - `SnapshotSender::from_path/metadata/chunk_at` for streaming + resume
+- `SnapshotReceiver::handle_chunk(SnapshotInstallRequest)` for network streaming/resume
 - `deterministic_state_hash(entries)`
 - `BatchOp::{Put, Delete}`
 
@@ -118,13 +126,26 @@ Embedded key-value database in Rust with durable WAL and crash recovery.
 - Legacy snapshot reader:
   - `TDBSNAP1`/`TDBSNAP2` can still be loaded for migration
 
-## Next milestones
+## Fault Matrix
 
-1. Raft protocol layer (leader election, match index, commit index)
-2. Snapshot install over network (streaming + resume)
-3. Serializable isolation (SSI) on top of replicated commits
-4. Crash/fault matrix (disk + network partitions + node restarts)
-5. CI/CD matrix in GitHub Actions (tests, benches, fault jobs)
+- Disk faults:
+  - truncated WAL tail
+  - CRC-corrupted WAL record
+  - interrupted snapshot install (`*.installing`)
+- Network faults:
+  - Raft append mismatch/backoff (`next_index` rewind on failure)
+  - snapshot stream offset mismatch (resume via `next_offset`)
+- Node restart:
+  - reopen + WAL replay
+  - PITR restore from archived WALs
+
+## CI/CD
+
+- GitHub Actions workflow: `.github/workflows/ci.yml`
+- Job matrix:
+  - `tests` on Ubuntu + Windows, Rust `stable` + `beta`
+  - `bench` smoke (`cargo bench --no-run`)
+  - `fault` suite (`raft`, WAL recovery, snapshot resume, replication conflict)
 
 ## Benchmarks
 

@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crc32fast::Hasher;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -227,6 +227,27 @@ pub struct SnapshotChunk {
     pub is_last: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotInstallRequest {
+    pub session_id: u64,
+    pub metadata: SnapshotMetadata,
+    pub offset: u64,
+    pub data: Vec<u8>,
+    pub is_last: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotInstallResponse {
+    pub accepted: bool,
+    pub next_offset: u64,
+    pub done: bool,
+}
+
+pub struct SnapshotReceiver {
+    target_path: PathBuf,
+    sessions: HashMap<u64, SnapshotInstall>,
+}
+
 impl SnapshotInstaller {
     pub fn begin(
         target_path: impl AsRef<Path>,
@@ -328,6 +349,63 @@ impl SnapshotInstall {
 
     pub fn current_offset(&self) -> u64 {
         self.written
+    }
+}
+
+impl SnapshotReceiver {
+    pub fn new(target_path: impl AsRef<Path>) -> Self {
+        Self {
+            target_path: target_path.as_ref().to_path_buf(),
+            sessions: HashMap::new(),
+        }
+    }
+
+    pub fn handle_chunk(&mut self, req: SnapshotInstallRequest) -> Result<SnapshotInstallResponse> {
+        if !self.sessions.contains_key(&req.session_id) {
+            let install = SnapshotInstaller::begin(&self.target_path, req.metadata.size, req.metadata.crc32)?;
+            self.sessions.insert(req.session_id, install);
+        }
+
+        let current_offset = self
+            .sessions
+            .get(&req.session_id)
+            .ok_or(Error::Corruption("snapshot session not found"))?
+            .current_offset();
+        if req.offset != current_offset {
+            return Ok(SnapshotInstallResponse {
+                accepted: false,
+                next_offset: current_offset,
+                done: false,
+            });
+        }
+
+        let next_offset = {
+            let entry = self
+                .sessions
+                .get_mut(&req.session_id)
+                .ok_or(Error::Corruption("snapshot session disappeared"))?;
+            entry.append_chunk(req.offset, &req.data)?;
+            entry.current_offset()
+        };
+        let done = req.is_last && next_offset == req.metadata.size;
+        if done {
+            let install = self
+                .sessions
+                .remove(&req.session_id)
+                .ok_or(Error::Corruption("snapshot session disappeared"))?;
+            install.finalize()?;
+            return Ok(SnapshotInstallResponse {
+                accepted: true,
+                next_offset: req.metadata.size,
+                done: true,
+            });
+        }
+
+        Ok(SnapshotInstallResponse {
+            accepted: true,
+            next_offset,
+            done: false,
+        })
     }
 }
 
@@ -676,5 +754,63 @@ mod tests {
         let l_hash = deterministic_state_hash(&leader.entries_from(1).expect("l entries"));
         let f_hash = deterministic_state_hash(&follower.entries_from(1).expect("f entries"));
         assert_eq!(l_hash, f_hash);
+    }
+
+    #[test]
+    fn snapshot_receiver_supports_streaming_resume() {
+        let src = unique_file("snapshot-net-src");
+        let dst = unique_file("snapshot-net-dst");
+        let bytes = b"network snapshot payload with resume semantics".repeat(512);
+        std::fs::write(&src, &bytes).expect("write src");
+
+        let sender = SnapshotSender::from_path(&src).expect("sender");
+        let meta = sender.metadata();
+        let mut receiver = SnapshotReceiver::new(&dst);
+        let session_id = 42_u64;
+
+        let c1 = sender.chunk_at(0, 1024).expect("c1");
+        let r1 = receiver
+            .handle_chunk(SnapshotInstallRequest {
+                session_id,
+                metadata: meta.clone(),
+                offset: c1.offset,
+                data: c1.data.clone(),
+                is_last: c1.is_last,
+            })
+            .expect("r1");
+        assert!(r1.accepted);
+
+        let stale = receiver
+            .handle_chunk(SnapshotInstallRequest {
+                session_id,
+                metadata: meta.clone(),
+                offset: 0,
+                data: c1.data,
+                is_last: false,
+            })
+            .expect("stale");
+        assert!(!stale.accepted);
+        assert_eq!(stale.next_offset, r1.next_offset);
+
+        let mut offset = r1.next_offset;
+        while offset < meta.size {
+            let c = sender.chunk_at(offset, 2048).expect("chunk");
+            let res = receiver
+                .handle_chunk(SnapshotInstallRequest {
+                    session_id,
+                    metadata: meta.clone(),
+                    offset: c.offset,
+                    data: c.data,
+                    is_last: c.is_last,
+                })
+                .expect("apply chunk");
+            offset = res.next_offset;
+            if res.done {
+                break;
+            }
+        }
+
+        let restored = std::fs::read(dst).expect("read dst");
+        assert_eq!(restored, bytes);
     }
 }
