@@ -15,7 +15,6 @@ impl Wal {
             .create(true)
             .read(true)
             .write(true)
-            .append(true)
             .open(path)?;
         Ok(Self { file })
     }
@@ -27,6 +26,7 @@ impl Wal {
         let crc = hasher.finalize();
         let len = payload.len() as u32;
 
+        self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&MAGIC.to_le_bytes())?;
         self.file.write_all(&len.to_le_bytes())?;
         self.file.write_all(&crc.to_le_bytes())?;

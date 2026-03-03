@@ -45,7 +45,6 @@ struct SegmentEntry {
 struct DbInner {
     dir: PathBuf,
     manifest_path: PathBuf,
-    wal_path: PathBuf,
     state: Mutex<DbState>,
     wal: Mutex<Wal>,
     commit_lock: Mutex<()>,
@@ -115,7 +114,6 @@ impl Database {
         let inner = Arc::new(DbInner {
             dir,
             manifest_path,
-            wal_path,
             state: Mutex::new(state),
             wal: Mutex::new(wal),
             commit_lock: Mutex::new(()),
@@ -864,30 +862,6 @@ fn materialize_delta_since(
         }
     }
     out
-}
-
-fn build_compaction_view(
-    dir: &Path,
-    segments: &[SegmentEntry],
-    mem: &BTreeMap<Vec<u8>, Vec<VersionedValue>>,
-) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>> {
-    let mut out = BTreeMap::new();
-    for segment in segments {
-        let path = dir.join(&segment.name);
-        if !path.exists() {
-            continue;
-        }
-        let table = read_table(&path)?;
-        for (k, v) in table {
-            out.insert(k, v);
-        }
-    }
-    for (k, versions) in mem {
-        if let Some(v) = versions.last() {
-            out.insert(k.clone(), v.value.clone());
-        }
-    }
-    Ok(out)
 }
 
 fn run_level_compaction_plan(dir: &Path, state: &mut DbState, commit_ts: u64) -> Result<()> {
