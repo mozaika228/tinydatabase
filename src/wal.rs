@@ -44,6 +44,15 @@ impl Wal {
         Ok(())
     }
 
+    pub fn read_all_bytes(&mut self) -> Result<Vec<u8>> {
+        self.file.sync_data()?;
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut out = Vec::new();
+        self.file.read_to_end(&mut out)?;
+        self.file.seek(SeekFrom::End(0))?;
+        Ok(out)
+    }
+
     pub fn read_all(path: &Path) -> Result<Vec<Record>> {
         let mut file = OpenOptions::new().read(true).open(path)?;
         file.seek(SeekFrom::Start(0))?;

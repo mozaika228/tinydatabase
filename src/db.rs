@@ -289,7 +289,8 @@ impl Database {
             .lock()
             .map_err(|_| Error::Corruption("wal lock poisoned"))?;
         wal.sync()?;
-        archive_wal_if_nonempty(&self.inner.wal_path, &self.inner.dir, checkpoint_commit_ts)?;
+        let wal_bytes = wal.read_all_bytes()?;
+        archive_wal_bytes_if_nonempty(&wal_bytes, &self.inner.dir, checkpoint_commit_ts)?;
         wal.reset()?;
         Ok(())
     }
@@ -1030,11 +1031,7 @@ fn materialize_latest_with_tombstones(
     out
 }
 
-fn archive_wal_if_nonempty(wal_path: &Path, db_dir: &Path, commit_ts: u64) -> Result<()> {
-    if !wal_path.exists() {
-        return Ok(());
-    }
-    let data = std::fs::read(wal_path)?;
+fn archive_wal_bytes_if_nonempty(data: &[u8], db_dir: &Path, commit_ts: u64) -> Result<()> {
     if data.is_empty() {
         return Ok(());
     }
