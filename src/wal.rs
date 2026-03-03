@@ -14,6 +14,7 @@ impl Wal {
         let file = OpenOptions::new()
             .create(true)
             .read(true)
+            .write(true)
             .append(true)
             .open(path)?;
         Ok(Self { file })
