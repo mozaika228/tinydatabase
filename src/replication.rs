@@ -315,7 +315,7 @@ impl SnapshotInstall {
         Ok(())
     }
 
-    pub fn finalize(mut self) -> Result<()> {
+    pub fn finalize(self) -> Result<()> {
         if self.written != self.expected_size {
             return Err(Error::InvalidData(format!(
                 "snapshot size mismatch: got {}, expected {}",

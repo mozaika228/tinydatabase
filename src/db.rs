@@ -133,7 +133,6 @@ impl Database {
         let snapshot_ts = state.last_commit_ts;
         let mem_read = read_visible_in_mem(&state, key, snapshot_ts);
         let segments = state.segments.clone();
-        let checkpoint_commit_ts = state.last_commit_ts;
         drop(state);
         match mem_read {
             MemRead::Found(v) => Ok(v),
@@ -280,6 +279,7 @@ impl Database {
         };
         write_manifest(&manifest_tmp, &manifest)?;
         fs::rename(&manifest_tmp, &self.inner.manifest_path)?;
+        let checkpoint_commit_ts = state.last_commit_ts;
         drop(state);
 
         let mut wal = self
@@ -479,68 +479,70 @@ impl Transaction {
         let mut ordered: Vec<_> = self.writes.iter().collect();
         ordered.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
 
-        let _commit_guard = self
-            .db
-            .inner
-            .commit_lock
-            .lock()
-            .map_err(|_| Error::Corruption("commit lock poisoned"))?;
+        {
+            let _commit_guard = self
+                .db
+                .inner
+                .commit_lock
+                .lock()
+                .map_err(|_| Error::Corruption("commit lock poisoned"))?;
 
-        let commit_ts = {
-            let state = self
+            let commit_ts = {
+                let state = self
+                    .db
+                    .inner
+                    .state
+                    .lock()
+                    .map_err(|_| Error::Corruption("state lock poisoned"))?;
+                for (key, _) in &ordered {
+                    let latest = latest_commit_ts_for_key(&state, key);
+                    if latest > self.snapshot_ts {
+                        return Err(Error::Conflict(format!(
+                            "write-write conflict for key {:?}",
+                            String::from_utf8_lossy(key)
+                        )));
+                    }
+                }
+                self.validate_serializable_reads(&state)?;
+                state.last_commit_ts + 1
+            };
+
+            {
+                let mut wal = self
+                    .db
+                    .inner
+                    .wal
+                    .lock()
+                    .map_err(|_| Error::Corruption("wal lock poisoned"))?;
+                for (key, value) in &ordered {
+                    match value {
+                        Some(v) => wal.append(&Record::Set {
+                            tx_id: self.tx_id,
+                            key: (*key).clone(),
+                            value: v.clone(),
+                        })?,
+                        None => wal.append(&Record::Delete {
+                            tx_id: self.tx_id,
+                            key: (*key).clone(),
+                        })?,
+                    }
+                }
+                wal.append(&Record::Commit { tx_id: self.tx_id })?;
+                wal.sync()?;
+            }
+
+            let mut state = self
                 .db
                 .inner
                 .state
                 .lock()
                 .map_err(|_| Error::Corruption("state lock poisoned"))?;
-            for (key, _) in &ordered {
-                let latest = latest_commit_ts_for_key(&state, key);
-                if latest > self.snapshot_ts {
-                    return Err(Error::Conflict(format!(
-                        "write-write conflict for key {:?}",
-                        String::from_utf8_lossy(key)
-                    )));
-                }
+            for (key, value) in ordered {
+                append_version(&mut state.data, key.clone(), commit_ts, value.clone());
             }
-            self.validate_serializable_reads(&state)?;
-            state.last_commit_ts + 1
-        };
-
-        {
-            let mut wal = self
-                .db
-                .inner
-                .wal
-                .lock()
-                .map_err(|_| Error::Corruption("wal lock poisoned"))?;
-            for (key, value) in &ordered {
-                match value {
-                    Some(v) => wal.append(&Record::Set {
-                        tx_id: self.tx_id,
-                        key: (*key).clone(),
-                        value: v.clone(),
-                    })?,
-                    None => wal.append(&Record::Delete {
-                        tx_id: self.tx_id,
-                        key: (*key).clone(),
-                    })?,
-                }
-            }
-            wal.append(&Record::Commit { tx_id: self.tx_id })?;
-            wal.sync()?;
+            state.last_commit_ts = commit_ts;
+            drop(state);
         }
-
-        let mut state = self
-            .db
-            .inner
-            .state
-            .lock()
-            .map_err(|_| Error::Corruption("state lock poisoned"))?;
-        for (key, value) in ordered {
-            append_version(&mut state.data, key.clone(), commit_ts, value.clone());
-        }
-        state.last_commit_ts = commit_ts;
-        drop(state);
 
         self.close();
         Ok(())
