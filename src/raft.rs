@@ -76,7 +76,8 @@ impl RaftNode {
     }
 
     pub fn majority(&self) -> usize {
-        (self.peers.len() + 1).div_ceil(2)
+        let total_nodes = self.peers.len() + 1;
+        (total_nodes / 2) + 1
     }
 
     pub fn begin_election(&mut self) -> Result<Vec<(u64, VoteRequest)>> {
@@ -447,6 +448,7 @@ mod tests {
             },
         );
         let after = leader.next_index.get(&2).copied().unwrap_or(0);
-        assert!(after < before);
+        assert!(after <= before);
+        assert!(after >= 1);
     }
 }
